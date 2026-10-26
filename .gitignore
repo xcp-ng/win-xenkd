@@ -1,0 +1,10 @@
+*.vcxproj.user
+.vs/
+
+x64/
+ARM64/
+
+__pycache__/
+
+xenkd/include/kdnetextensibility.h
+xenkd/include/kdnetshareddata.h

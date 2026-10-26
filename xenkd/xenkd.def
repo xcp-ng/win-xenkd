@@ -1,0 +1,5 @@
+LIBRARY kd_08_5853
+
+EXPORTS
+    KdInitializeLibrary
+
