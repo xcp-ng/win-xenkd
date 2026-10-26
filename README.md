@@ -146,7 +146,6 @@ the announce lines.
 ## Development
 
 - Bridge tests run anywhere, without Xen: `python scripts/test_xenkd_bridge.py`.
-- [AGENTS.md](AGENTS.md) has the build checks, code constraints and the shared-area contract.
 
 ## Limitations
 
