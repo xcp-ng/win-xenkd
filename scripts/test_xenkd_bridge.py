@@ -510,7 +510,10 @@ class ChecksumTest(unittest.TestCase):
         # What the bridge builds for the guest is what it accepts from the guest.
         proxy = bridge.UdpProxy(
             types.SimpleNamespace(
-                guest_ip="169.254.0.2", debugger=None, local_port=None
+                guest_ip="169.254.0.2",
+                guest_port=None,
+                debugger=None,
+                local_port=None,
             )
         )
         proxy.guest_mac = b"\x02" * 6
@@ -525,6 +528,92 @@ class ChecksumTest(unittest.TestCase):
             self.assertEqual(len(frame), 42 + length)
             self.assertEqual(bridge.checksum(frame[14:34]), 0)
             self.assertIsNone(proxy.check_udp(frame, 20, len(frame) - 34))
+
+
+class FilterTest(unittest.TestCase):
+    GUEST = b"\xa9\xfe\x00\x02"
+    OTHER = b"\xa9\xfe\x77\x28"
+    HOST = b"\xa9\xfe\x00\x01"
+
+    def make_proxy(self, guest_ip="169.254.0.2", guest_port=None):
+        proxy = bridge.UdpProxy(
+            types.SimpleNamespace(
+                guest_ip=guest_ip,
+                guest_port=guest_port,
+                debugger=None,
+                local_port=None,
+            )
+        )
+        proxy.guest_mac = b"\x02" * 6
+        proxy.sent = []
+        proxy.socket = types.SimpleNamespace(
+            sendto=lambda data, address: proxy.sent.append(data)
+        )
+        return proxy
+
+    def guest_frame(self, source_ip, payload=b"hello"):
+        # The proxy's frames for the guest, with the addresses swapped, make the guest's frames for the proxy.
+        builder = self.make_proxy()
+        builder.host_ip, builder.host_port = source_ip, 5364
+        builder.guest_ip, builder.guest_port = self.HOST, 5364
+        builder.socket = types.SimpleNamespace(recvfrom=lambda size: (payload, None))
+        return builder.from_debugger()
+
+    def arp_request(self, sender_ip):
+        mac = b"\x02" * 6
+        return (
+            b"\xff" * 6
+            + mac
+            + bridge.ETHERTYPE_ARP
+            + struct.pack("!HHBBH", 1, 0x0800, 6, 4, bridge.ARP_REQUEST)
+            + mac
+            + sender_ip
+            + bytes(6)
+            + self.HOST
+        ).ljust(60, b"\0")
+
+    def test_forwards_the_guest(self):
+        proxy = self.make_proxy()
+        proxy.from_guest(self.guest_frame(self.GUEST))
+        self.assertEqual(proxy.sent, [b"hello"])
+        self.assertEqual((proxy.host_ip, proxy.host_port), (self.HOST, 5364))
+
+    def test_ignores_other_hosts(self):
+        proxy = self.make_proxy()
+        proxy.from_guest(self.guest_frame(self.OTHER))
+        self.assertEqual(proxy.sent, [])
+        self.assertIsNone(proxy.host_ip)
+        self.assertIsNone(proxy.guest_port)
+
+    def test_ignores_other_arp(self):
+        proxy = self.make_proxy()
+        self.assertEqual(proxy.arp(self.arp_request(self.OTHER)), [])
+        self.assertEqual(len(proxy.arp(self.arp_request(self.GUEST))), 1)
+
+    def test_any_port_by_default(self):
+        proxy = self.make_proxy()
+        self.assertIsNone(proxy.guest_port)
+        proxy.from_guest(self.guest_frame(self.GUEST))
+        self.assertEqual(proxy.guest_port, 5364)
+
+    def test_filters_by_port(self):
+        proxy = self.make_proxy(guest_port=1234)
+        self.assertEqual(proxy.guest_port, 1234)
+        proxy.from_guest(self.guest_frame(self.GUEST))
+        self.assertEqual(proxy.sent, [])
+        self.assertIsNone(proxy.host_ip)
+        self.assertEqual(proxy.guest_port, 1234)
+
+        proxy = self.make_proxy(guest_port=5364)
+        proxy.from_guest(self.guest_frame(self.GUEST))
+        self.assertEqual(proxy.sent, [b"hello"])
+
+    def test_learns_the_guest_without_an_address(self):
+        proxy = self.make_proxy(guest_ip="")
+        self.assertIsNone(proxy.guest_ip)
+        proxy.from_guest(self.guest_frame(self.OTHER))
+        self.assertEqual(proxy.sent, [b"hello"])
+        self.assertEqual(proxy.guest_ip, self.OTHER)
 
 
 if __name__ == "__main__":

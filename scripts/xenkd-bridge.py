@@ -639,6 +639,8 @@ class UdpProxy:
 
         if args.guest_ip:
             self.guest_ip = socket.inet_aton(args.guest_ip)
+        # With --guest-port, replies can go out before the guest has sent anything.
+        self.guest_port = args.guest_port
         if args.debugger is not None:
             # The guest's HOST_IP and HOST_PORT are the debugger's address, until it says otherwise.
             try:
@@ -684,6 +686,11 @@ class UdpProxy:
         source_port, destination_port, length = struct.unpack(
             "!HHH", frame[udp : udp + 6]
         )
+        # The guest's other traffic (NetBIOS, mDNS...) isn't for the debugger, and must not change where replies go.
+        if self.guest_ip is not None and frame[26:30] != self.guest_ip:
+            return []
+        if self.args.guest_port is not None and source_port != self.args.guest_port:
+            return []
         problem = self.check_udp(frame, header_length, length)
         if problem is not None:
             # Don't hand the debugger something it can only reject ("Bad packet sent from ...").
@@ -752,7 +759,10 @@ class UdpProxy:
         # Don't answer probes (no sender address yet) or announcements: they check that nobody else owns that address.
         if operation != ARP_REQUEST or sender_ip in (b"\0\0\0\0", target_ip):
             return []
-        # A restarted bridge, or a rebooted guest with a new link-local address, may see ARP before any UDP.
+        # Only the guest's KDNET address is answered, so that other hosts' ARP doesn't change where replies go.
+        if self.guest_ip is not None and sender_ip != self.guest_ip:
+            return []
+        # A restarted bridge may see ARP before any UDP, when it has to learn the guest's address (--guest-ip '').
         self.guest_mac, self.guest_ip = sender_mac, sender_ip
         if self.host_ip is None:
             self.host_ip = target_ip
@@ -897,6 +907,13 @@ def main():
         default="169.254.0.2",
         help="the guest's TARGET_IP, as set by Enable-XenKd.ps1 -TargetIp"
         " (default: %(default)s; '' to learn it from the guest's first packet)",
+    )
+    parser.add_argument(
+        "--guest-port",
+        type=int,
+        metavar="PORT",
+        help="only forward UDP from this guest port, which KDNET uses on both ends"
+        " (default: any, learned from the guest's first packet)",
     )
     parser.add_argument(
         "-p",
