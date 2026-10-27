@@ -9,8 +9,8 @@ HOST_IP:port, or --debugger. DHCP isn't answered, so the guest needs NO_DHCP and
 them). Attach with `windbg -k net:port=<port>,key=<key>`.
 
 The bridge can be restarted during a debug session: it talks to the debugger from a fixed port, knows the guest's
-address right away (its MAC follows from the domain's UUID, its IP is --guest-ip), and xenkd announces its rings again
-within about 3 s of the bridge going away.
+address right away (its MAC follows from the domain's UUID, its IP is --guest-ip if given), and xenkd announces its
+rings again within about 3 s of the bridge going away.
 
 It follows the guest across reboots, which change its domid: by its UUID on XAPI hosts (XenServer, XCP-ng), where names
 can repeat, and by its name with xl, where `xl create` gives a new UUID unless the config sets one. A domid, or the
@@ -82,6 +82,8 @@ ARP_REQUEST = 1
 ARP_REPLY = 2
 # What the guest sees as the MAC of every other host (locally administered).
 PROXY_MAC = b"\x02\x00\x00\x6b\x64\x00"
+# Where Enable-XenKd.ps1 points KDNET (-HostIp and -Port) unless told otherwise.
+DEFAULT_DESTINATION = "169.254.0.1:5364"
 
 
 def log(message):
@@ -608,6 +610,11 @@ def parse_address(text):
     return host, int(port)
 
 
+def resolve_ipv4(host):
+    """A host name or address, as an IPv4 address in network order. Raises OSError."""
+    return socket.inet_aton(socket.gethostbyname(host))
+
+
 def checksum(data):
     """The Internet checksum (RFC 1071) of data."""
     if len(data) % 2:
@@ -623,8 +630,9 @@ class UdpProxy:
     """Stand in for KDNET's network: answer its ARP and carry its UDP traffic over a dom0 socket.
 
     Restarting the bridge mustn't break a debug session, so the socket uses a fixed port: WinDbg keeps seeing the target
-    at the same address. A restarted bridge knows the guest's address from --guest-ip (its TARGET_IP), and learns the
-    rest again from its next ARP or UDP packet.
+    at the same address. A restarted bridge knows the debugger's address from --destination (the guest's HOST_IP and
+    port) and the guest's from --guest-ip (its TARGET_IP), if given, and learns the rest again from its next ARP or UDP
+    packet.
     """
 
     def __init__(self, args):
@@ -633,21 +641,40 @@ class UdpProxy:
         # The guest's end (MAC, IP, UDP port), and the debugger as the guest addresses it (IP, UDP port).
         self.guest_mac = self.guest_ip = self.guest_port = None
         self.host_ip = self.host_port = None
+        self.destination = None
         self.ip_id = 0
         self.dhcp_logged = False
         self.corrupted = DropCounter("damaged frame from the guest")
 
         if args.guest_ip:
             self.guest_ip = socket.inet_aton(args.guest_ip)
-        # With --guest-port, replies can go out before the guest has sent anything.
-        self.guest_port = args.guest_port
         if args.debugger is not None:
             # The guest's HOST_IP and HOST_PORT are the debugger's address, until it says otherwise.
             try:
-                self.host_ip = socket.inet_aton(socket.gethostbyname(args.debugger[0]))
+                self.host_ip = resolve_ipv4(args.debugger[0])
             except OSError:
                 pass
             self.host_port = args.debugger[1]
+        if args.destination is not None:
+            # Replies can go out before the guest has sent anything.
+            try:
+                self.destination = (
+                    resolve_ipv4(args.destination[0]),
+                    args.destination[1],
+                )
+            except OSError as e:
+                raise SystemExit("bad --destination %s: %s" % (args.destination[0], e))
+            self.host_ip, self.host_port = self.destination
+            log(
+                "only forwarding UDP the guest sends to %s:%d"
+                % (socket.inet_ntoa(self.destination[0]), self.destination[1])
+            )
+        else:
+            log("forwarding UDP the guest sends to any address")
+        if self.guest_ip is not None:
+            log("only talking to guest %s" % socket.inet_ntoa(self.guest_ip))
+        else:
+            log("talking to any guest address")
         # Otherwise the socket opens once the guest says which port it talks to.
         if args.local_port or args.debugger is not None:
             self.open_socket(args.local_port or args.debugger[1])
@@ -664,8 +691,8 @@ class UdpProxy:
                 " one with --local-port)" % (port, e)
             )
         self.socket.setblocking(False)
-        target = " to %s:%d" % self.args.debugger if self.args.debugger else ""
-        log("forwarding KDNET traffic from udp port %d%s" % (port, target))
+        target = " at %s:%d" % self.args.debugger if self.args.debugger else ""
+        log("talking to the debugger%s from dom0 udp port %d" % (target, port))
 
     def debugger(self):
         if self.args.debugger is not None:
@@ -689,8 +716,6 @@ class UdpProxy:
         # The guest's other traffic (NetBIOS, mDNS...) isn't for the debugger, and must not change where replies go.
         if self.guest_ip is not None and frame[26:30] != self.guest_ip:
             return []
-        if self.args.guest_port is not None and source_port != self.args.guest_port:
-            return []
         problem = self.check_udp(frame, header_length, length)
         if problem is not None:
             # Don't hand the debugger something it can only reject ("Bad packet sent from ...").
@@ -705,6 +730,8 @@ class UdpProxy:
                     "the guest is asking for DHCP, which the bridge doesn't answer: give it"
                     " NO_DHCP (and TARGET_IP) to skip the wait for a link-local address"
                 )
+            return []
+        if self.destination not in (None, (frame[30:34], destination_port)):
             return []
 
         guest = frame[6:12], frame[26:30], source_port
@@ -759,8 +786,11 @@ class UdpProxy:
         # Don't answer probes (no sender address yet) or announcements: they check that nobody else owns that address.
         if operation != ARP_REQUEST or sender_ip in (b"\0\0\0\0", target_ip):
             return []
-        # Only the guest's KDNET address is answered, so that other hosts' ARP doesn't change where replies go.
+        # Only the guest's KDNET address, asking for the debugger's, is answered, so that other hosts' ARP doesn't change
+        # where replies go.
         if self.guest_ip is not None and sender_ip != self.guest_ip:
+            return []
+        if self.destination is not None and target_ip != self.destination[0]:
             return []
         # A restarted bridge may see ARP before any UDP, when it has to learn the guest's address (--guest-ip '').
         self.guest_mac, self.guest_ip = sender_mac, sender_ip
@@ -902,21 +932,21 @@ def main():
         help="the debugger's address (default: the guest's HOST_IP and port)",
     )
     parser.add_argument(
-        "-g",
         "--guest-ip",
-        default="169.254.0.2",
-        help="the guest's TARGET_IP, as set by Enable-XenKd.ps1 -TargetIp"
-        " (default: %(default)s; '' to learn it from the guest's first packet)",
+        metavar="IP",
+        help="only talk to this guest address, its TARGET_IP as set by Enable-XenKd.ps1"
+        " -TargetIp (default: any, learned from the guest's first packet)",
     )
     parser.add_argument(
-        "--guest-port",
-        type=int,
-        metavar="PORT",
-        help="only forward UDP from this guest port, which KDNET uses on both ends"
-        " (default: any, learned from the guest's first packet)",
+        "--destination",
+        type=parse_address,
+        default=DEFAULT_DESTINATION,
+        metavar="IP:PORT",
+        help="only forward UDP the guest sends to this address, its HOST_IP and port as"
+        " set by Enable-XenKd.ps1 -HostIp and -Port, and only answer ARP for the IP"
+        " (default: %(default)s)",
     )
     parser.add_argument(
-        "-p",
         "--local-port",
         type=int,
         metavar="PORT",

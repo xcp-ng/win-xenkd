@@ -118,9 +118,9 @@ dom0 on one UDP port, and accept packets from it.
 | Option                       | Default                    | Meaning                                                    |
 |------------------------------|----------------------------|------------------------------------------------------------|
 | `-d`, `--debugger HOST:PORT` | the guest's `HOST_IP:port` | Where WinDbg runs, overrides the guest's choice            |
-| `-g`, `--guest-ip IP`        | `169.254.0.2`              | The guest's `-TargetIp`; `''` to learn it from its traffic |
-| `--guest-port PORT`          | any                        | Only forward UDP from this guest port (`-Port`)            |
-| `-p`, `--local-port PORT`    | WinDbg's port              | dom0's port; set it if WinDbg runs in dom0                 |
+| `--destination IP:PORT`      | `169.254.0.1:5364`         | The guest's `-HostIp` and `-Port`; ignore other traffic    |
+| `--guest-ip IP`              | any                        | The guest's `-TargetIp`; ignore other guest addresses      |
+| `--local-port PORT`          | WinDbg's port              | dom0's port; set it if WinDbg runs in dom0                 |
 | `--fast`                     |                            | Poll continuously while frames flow (see Limitations)      |
 | `-v`, `--verbose`            |                            | Log every frame, and the guest's other console output      |
 

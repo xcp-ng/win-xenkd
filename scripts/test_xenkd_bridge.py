@@ -511,7 +511,7 @@ class ChecksumTest(unittest.TestCase):
         proxy = bridge.UdpProxy(
             types.SimpleNamespace(
                 guest_ip="169.254.0.2",
-                guest_port=None,
+                destination=None,
                 debugger=None,
                 local_port=None,
             )
@@ -535,11 +535,11 @@ class FilterTest(unittest.TestCase):
     OTHER = b"\xa9\xfe\x77\x28"
     HOST = b"\xa9\xfe\x00\x01"
 
-    def make_proxy(self, guest_ip="169.254.0.2", guest_port=None):
+    def make_proxy(self, guest_ip="169.254.0.2", destination=None):
         proxy = bridge.UdpProxy(
             types.SimpleNamespace(
                 guest_ip=guest_ip,
-                guest_port=guest_port,
+                destination=destination,
                 debugger=None,
                 local_port=None,
             )
@@ -590,23 +590,36 @@ class FilterTest(unittest.TestCase):
         self.assertEqual(proxy.arp(self.arp_request(self.OTHER)), [])
         self.assertEqual(len(proxy.arp(self.arp_request(self.GUEST))), 1)
 
-    def test_any_port_by_default(self):
+    def test_any_destination_by_default(self):
         proxy = self.make_proxy()
-        self.assertIsNone(proxy.guest_port)
-        proxy.from_guest(self.guest_frame(self.GUEST))
-        self.assertEqual(proxy.guest_port, 5364)
-
-    def test_filters_by_port(self):
-        proxy = self.make_proxy(guest_port=1234)
-        self.assertEqual(proxy.guest_port, 1234)
-        proxy.from_guest(self.guest_frame(self.GUEST))
-        self.assertEqual(proxy.sent, [])
         self.assertIsNone(proxy.host_ip)
-        self.assertEqual(proxy.guest_port, 1234)
-
-        proxy = self.make_proxy(guest_port=5364)
         proxy.from_guest(self.guest_frame(self.GUEST))
         self.assertEqual(proxy.sent, [b"hello"])
+        self.assertEqual((proxy.host_ip, proxy.host_port), (self.HOST, 5364))
+
+    def test_filters_by_destination(self):
+        # The guest's frames are for HOST:5364.
+        for address, port, host_ip in (
+            ("169.254.0.1", 1234, self.HOST),
+            ("169.254.119.40", 5364, self.OTHER),
+        ):
+            proxy = self.make_proxy(destination=(address, port))
+            proxy.from_guest(self.guest_frame(self.GUEST))
+            self.assertEqual(proxy.sent, [])
+            # Only the destination is known, from the options.
+            self.assertEqual((proxy.host_ip, proxy.host_port), (host_ip, port))
+            self.assertIsNone(proxy.guest_port)
+
+        proxy = self.make_proxy(destination=("169.254.0.1", 5364))
+        proxy.from_guest(self.guest_frame(self.GUEST))
+        self.assertEqual(proxy.sent, [b"hello"])
+        self.assertEqual(proxy.guest_port, 5364)
+
+    def test_answers_arp_for_the_destination_only(self):
+        proxy = self.make_proxy(destination=("169.254.119.40", 5364))
+        self.assertEqual(proxy.arp(self.arp_request(self.GUEST)), [])
+        proxy = self.make_proxy(destination=("169.254.0.1", 5364))
+        self.assertEqual(len(proxy.arp(self.arp_request(self.GUEST))), 1)
 
     def test_learns_the_guest_without_an_address(self):
         proxy = self.make_proxy(guest_ip="")
