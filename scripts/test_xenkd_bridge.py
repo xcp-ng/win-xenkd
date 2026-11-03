@@ -462,6 +462,7 @@ class IoreqTest(unittest.TestCase):
         self.dm.xendevicemodel_map_io_range_to_ioreq_server.return_value = 0
         self.dm.xendevicemodel_destroy_ioreq_server.return_value = 0
         self.evt.xenevtchn_notify.return_value = 0
+        self.evt.xenevtchn_notify.side_effect = self.notify
         self.evt.xenevtchn_unmask.return_value = 0
         patch = mock.patch.object(
             bridge, "xen_library", side_effect=[self.dm, self.evt]
@@ -477,10 +478,18 @@ class IoreqTest(unittest.TestCase):
 
     def enable(self, handle, domid, server_id, enabled):
         self.assertTrue(self.memory.resource_mapped)
-        for cpu in range(2):
-            struct.pack_into(
-                "<I", self.memory.ioreq, cpu * bridge.IOREQ.size + 24, 11 + cpu
-            )
+        if enabled:
+            for cpu in range(2):
+                struct.pack_into(
+                    "<I", self.memory.ioreq, cpu * bridge.IOREQ.size + 24, 11 + cpu
+                )
+        return 0
+
+    def notify(self, handle, local):
+        # Xen consumes the published response when the notified vCPU resumes.
+        offset = (local - 111) * bridge.IOREQ.size + bridge.IOREQ_STATE_OFFSET
+        self.assertEqual(self.memory.ioreq[offset] & 0xF, bridge.IORESP_READY)
+        self.memory.ioreq[offset] &= 0xF0
         return 0
 
     def server(self, port=bridge.DEFAULT_IO_PORT):
@@ -514,6 +523,9 @@ class IoreqTest(unittest.TestCase):
             1, int(DOMID), 7, 0, 0xE0, 0xE3
         )
         server.close()
+        self.dm.xendevicemodel_set_ioreq_server_state.assert_called_with(
+            1, int(DOMID), 7, 0
+        )
         self.dm.xendevicemodel_destroy_ioreq_server.assert_called_once_with(
             1, int(DOMID), 7
         )
@@ -521,6 +533,58 @@ class IoreqTest(unittest.TestCase):
         self.assertIsNone(server.fd)
         # close() is idempotent, including cleanup callbacks.
         server.close()
+        self.dm.xendevicemodel_destroy_ioreq_server.assert_called_once()
+
+    def test_close_completes_pending_requests_before_destroy(self):
+        server = self.server()
+        self.request(server)
+        self.request(server, cpu=1, flags=bridge.IOREQ_INPROCESS | bridge.IOREQ_READ)
+        # A response may have been published just before an exception skipped its notification.
+        self.request(server, cpu=2, flags=bridge.IORESP_READY, data=0x1234)
+        notifications = []
+
+        def notify(handle, local):
+            self.dm.xendevicemodel_set_ioreq_server_state.assert_called_with(
+                1, int(DOMID), 7, 0
+            )
+            self.dm.xendevicemodel_destroy_ioreq_server.assert_not_called()
+            self.assertTrue(self.memory.resource_mapped)
+            notifications.append(local)
+            return self.notify(handle, local)
+
+        self.evt.xenevtchn_notify.side_effect = notify
+        server.close()
+        self.assertEqual(notifications, [111, 112, 113])
+        self.assertEqual(
+            struct.unpack_from("<Q", self.memory.ioreq, 40)[0], 0xFFFFFFFFFFFFFFFF
+        )
+        self.assertEqual(struct.unpack_from("<Q", self.memory.ioreq, 72)[0], 0x1234)
+        self.assertFalse(self.link.attached)
+        self.assertFalse(self.memory.resource_mapped)
+
+    def test_close_waits_for_response_consumption(self):
+        server = self.server()
+        self.request(server, flags=bridge.IOREQ_READY | bridge.IOREQ_READ)
+        self.evt.xenevtchn_notify.side_effect = None
+
+        def consume(delay):
+            self.assertEqual(self.memory.ioreq[30] & 0xF, bridge.IORESP_READY)
+            self.dm.xendevicemodel_destroy_ioreq_server.assert_not_called()
+            self.memory.ioreq[30] &= 0xF0
+
+        with mock.patch.object(bridge.time, "sleep", side_effect=consume) as sleep:
+            server.close()
+        sleep.assert_called_once_with(0.001)
+        self.dm.xendevicemodel_destroy_ioreq_server.assert_called_once()
+
+    def test_close_reports_unconsumed_response_without_waiting_forever(self):
+        server = self.server()
+        self.request(server)
+        self.evt.xenevtchn_notify.side_effect = None
+        with mock.patch.object(bridge, "IOREQ_DRAIN_TIMEOUT", 0):
+            with mock.patch.object(bridge, "log") as log:
+                server.close()
+        log.assert_any_call("timed out waiting for 1 i/o responses to be consumed")
         self.dm.xendevicemodel_destroy_ioreq_server.assert_called_once()
 
     def test_pfns_and_close_on_different_vcpus(self):
@@ -614,6 +678,28 @@ class IoreqTest(unittest.TestCase):
         for value in ("0", "-4", "0xed", "0xffff", "0x10000", "hello"):
             with self.assertRaises(bridge.argparse.ArgumentTypeError):
                 bridge.parse_io_port(value)
+
+
+class ShutdownTest(unittest.TestCase):
+    def test_signals_request_shutdown_without_interrupting_an_operation(self):
+        handlers = {}
+
+        def set_signal(which, handler):
+            handlers[which] = handler
+
+        def run(args, stopping):
+            self.assertFalse(stopping())
+            handlers[bridge.signal.SIGINT](bridge.signal.SIGINT, None)
+            self.assertTrue(stopping())
+            # Repeated signals must also let cleanup finish.
+            handlers[bridge.signal.SIGTERM](bridge.signal.SIGTERM, None)
+            self.assertTrue(stopping())
+
+        with mock.patch.object(bridge.sys, "argv", ["xenkd-bridge.py", DOMID]):
+            with mock.patch.object(bridge.signal, "signal", side_effect=set_signal):
+                with mock.patch.object(bridge, "run", side_effect=run) as mocked_run:
+                    bridge.main()
+        mocked_run.assert_called_once()
 
 
 class FakeXenstore:

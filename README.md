@@ -145,6 +145,9 @@ The bridge:
 - **follows reboots**: it waits for the domain to come back, whatever its new domid, then reattaches;
 - **lets go cleanly** on Ctrl+C or SIGTERM, so the guest notices at once.
 
+On a clean exit, the bridge disables new ioreq requests, completes and notifies any pending requests, then destroys
+the server. It logs `stopped ioreq server` on success; a timeout waiting for response consumption is logged separately.
+
 For older console-based installations, `-ClearAll` still undoes the old xencons and xenbus console settings; run it
 before enabling the new DLL if you want to restore the PV console. It cannot recover the previous console log level.
 

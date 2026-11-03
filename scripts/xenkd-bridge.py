@@ -85,6 +85,8 @@ IORESP_READY = 3
 IOREQ_READ = 0x20
 IOREQ_DATA_IS_PTR = 0x10
 IOREQ_TYPE_PIO = 0
+# Give Xen time to consume responses before freeing the server and its event channels.
+IOREQ_DRAIN_TIMEOUT = 1.0
 
 ETHERTYPE_IPV4 = b"\x08\x00"
 ETHERTYPE_ARP = b"\x08\x06"
@@ -358,6 +360,7 @@ class IoreqServer:
         self.domid, self.io_port, self.memory = int(domid), io_port, memory
         self.dm_handle = self.evt_handle = self.server_id = None
         self.resource = self.area = self.fd = None
+        self.enabled = False
         self.ports = {}
         self.next_bind_check = 0.0
         self.dm = xen_library(
@@ -414,6 +417,7 @@ class IoreqServer:
                 ),
                 "xendevicemodel_set_ioreq_server_state",
             )
+            self.enabled = True
             self.refresh_ports()
             self.fd = xen_check(self.evt.xenevtchn_fd(self.evt_handle), "xenevtchn_fd")
             xen_check(
@@ -497,9 +501,62 @@ class IoreqServer:
                     "xenevtchn_unmask",
                 )
 
+    def drain(self):
+        """After disabling new requests, wake vCPUs waiting for a response, including an interrupted notification."""
+        self.next_bind_check = 0.0
+        self.refresh_ports()
+        pending = []
+        for local, offset in self.ports.items():
+            flags = self.area[offset + IOREQ_STATE_OFFSET]
+            state = flags & 0xF
+            if state not in (IOREQ_READY, IOREQ_INPROCESS, IORESP_READY):
+                continue
+            if state != IORESP_READY:
+                # Don't attach new rings during exit. An unfinished scalar IN sees a detached register.
+                if flags & IOREQ_READ and not flags & IOREQ_DATA_IS_PTR:
+                    struct.pack_into("<Q", self.area, offset + 8, 0xFFFFFFFFFFFFFFFF)
+                self.area[offset + IOREQ_STATE_OFFSET] = (flags & 0xF0) | IORESP_READY
+            xen_check(
+                self.evt.xenevtchn_notify(self.evt_handle, local), "xenevtchn_notify"
+            )
+            pending.append(offset)
+        if not pending:
+            return
+        log("completing %d pending i/o requests before exit" % len(pending))
+        deadline = time.monotonic() + IOREQ_DRAIN_TIMEOUT
+        while pending:
+            pending = [
+                offset
+                for offset in pending
+                if self.area[offset + IOREQ_STATE_OFFSET] & 0xF
+            ]
+            if not pending:
+                break
+            if time.monotonic() >= deadline:
+                log(
+                    "timed out waiting for %d i/o responses to be consumed"
+                    % len(pending)
+                )
+                break
+            time.sleep(0.001)
+
     def close(self):
-        # Closing the dom0 handles alone does not destroy a server owned by dom0. Destroy it explicitly, which also
-        # removes its ranges and releases pending requests, before unmapping Xen's request page.
+        # Destroying a server frees its event channels; it isn't a substitute for notifying a blocked vCPU.
+        # Disable first so no new requests race with the final responses, and retain the request page until done.
+        if self.enabled:
+            try:
+                xen_check(
+                    self.dm.xendevicemodel_set_ioreq_server_state(
+                        self.dm_handle, self.domid, self.server_id, 0
+                    ),
+                    "xendevicemodel_set_ioreq_server_state",
+                )
+                self.enabled = False
+                self.drain()
+            except OSError as e:
+                if e.errno not in (errno.ESRCH, errno.ENOENT):
+                    log("cannot drain ioreq server: %s" % e)
+        # A server owned by dom0 outlives its process unless explicitly destroyed.
         if self.server_id is not None:
             result = self.dm.xendevicemodel_destroy_ioreq_server(
                 self.dm_handle, self.domid, self.server_id
@@ -509,7 +566,10 @@ class IoreqServer:
                     "cannot destroy ioreq server: %s"
                     % xen_error("destroy_ioreq_server")
                 )
+            elif result >= 0:
+                log("stopped ioreq server (domain %s)" % self.domid)
             self.server_id = None
+            self.enabled = False
         if self.area is not None:
             self.area.release()
             self.area = None
@@ -1062,7 +1122,7 @@ class UdpProxy:
         )
 
 
-def run(args):
+def run(args, stopping):
     key = follow_key()
     domain = Domain(key, resolve_domain(args.domain, key))
     link = GuestLink(args)
@@ -1076,7 +1136,7 @@ def run(args):
 
     try:
         proxy = UdpProxy(args)
-        while True:
+        while not stopping():
             # Domain lookups run commands, so defer them while packet traffic is active.
             changed = domain.poll() if not link.busy() else False
             link.follow(domain)
@@ -1113,7 +1173,7 @@ def run(args):
             ]
             timeout = link.timeout(domain.time_to_poll())
             spin_until = time.monotonic() + SPIN_SLICE if timeout == 0 else 0.0
-            while True:
+            while not stopping():
                 readable = select.select(readers, [], [], timeout)[0]
                 config_read = server is not None and server.fd in readable
                 if config_read:
@@ -1141,7 +1201,7 @@ def run(args):
                 if config_read or time.monotonic() >= spin_until:
                     break
     finally:
-        # Release the shared rings before destroying the server lets a blocked shutdown OUT return.
+        # Release the shared rings before close() completes any outstanding shutdown OUT.
         try:
             link.detach("the bridge is exiting")
         finally:
@@ -1218,10 +1278,17 @@ def main():
     )
     args = parser.parse_args()
 
-    # Exit through the finally clauses, which tell the guest we're gone.
-    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
+    stop_requested = False
+
+    def request_stop(signum, frame):
+        nonlocal stop_requested
+        # Don't raise inside an ioreq update, mapping operation or cleanup. Finish the current operation first.
+        stop_requested = True
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
     try:
-        run(args)
+        run(args, lambda: stop_requested)
     except KeyboardInterrupt:
         pass
     except (OSError, AttributeError) as e:
