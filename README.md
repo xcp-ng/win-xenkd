@@ -34,12 +34,12 @@ It's fast:
   [xenkd/xenkd_shm.h](xenkd/xenkd_shm.h).
 - **Rendezvous.** While no bridge is attached, xenkd writes the header PFN once a second to I/O port `0xEC` using
   KDNET's `WRITE_PORT_ULONG`. The bridge registers a secondary Xen ioreq server for `0xEC–0xEF` and retains two
-  mappings: the header page, and the 24 ring pages listed in its `RingGfn[]` array. The header's signature encodes
-  layout version 2, which fixes the slot size and ring counts; its generation identifies the initialization.
+  mappings: the header page, and the 24 ring pages listed in its `RingGfn[]` array. The full signature `0x02444B58`
+  identifies the fixed slot size and ring counts; its generation identifies the initialization.
   A `READ_PORT_ULONG` returns the accepted header PFN, or `0xFFFFFFFF` if
   detached. Without acknowledgement, xenkd starts with its link down and retries later. Writing `0xFFFFFFFF` closes
   the link: the bridge unmaps before the guest's write completes. The port identifies rendezvous protocol v1; the
-  ring layout has its own version.
+  ring layout has its own signature.
 - **Liveness.** The bridge bumps a heartbeat on every poll. Without one for 2 s, xenkd treats the link as down (frames
   are dropped, like a NIC without a cable) and announces itself again. Every re-initialization of KDNET gets a new
   generation, so the bridge never writes into a stale area.
@@ -49,14 +49,15 @@ The default `0xEC–0xEF` range is covered by the Xen HVM DSDT's motherboard res
 other virtual hardware. To change ports, use `Enable-XenKd.ps1 -IoPort 0x...` in the guest and `--io-port 0x...` on the
 bridge. The guest option is stored as hexadecimal `XENKD_IOPORT=0x...` in BCD loadoptions. The base must be nonzero,
 four-byte aligned and no greater than `0xFFFC`; reserve all four bytes in guest ACPI when choosing another range.
-The version 2 header is incompatible with the earlier layout: update the guest DLL and bridge together. The I/O
+The current header is incompatible with the earlier layout: update the guest DLL and bridge together. The I/O
 register protocol and default port are unchanged.
 
 ## Requirements
 
-- A Xen host with a dom0 shell as root (developed on XCP-ng), with CPython 3.6 or later, `libxenforeignmemory` (with
-  resource mapping), `libxendevicemodel` and `libxenevtchn`. The bridge maps guest memory through CPython's C API, so
-  it doesn't run on PyPy.
+- A Xen host with a dom0 shell as root (developed on XCP-ng), with Python 3.6 or later, CFFI 1.9.1 or later,
+  `libxenforeignmemory` (with resource mapping), `libxendevicemodel` and `libxenevtchn`. The bridge uses CFFI's ABI mode
+  to load the libraries and expose mapped memory directly; no compiler, Xen development headers or generated
+  extension module is needed at runtime.
 - A 64-bit Windows HVM guest with the **xenkd PCI device** (vendor `5853`, device `C201`) attached. KDNET picks its
   extensibility module by PCI vendor ID, and xenkd checks that it was loaded for this device.
 - To build: Visual Studio with the WDK.
@@ -163,7 +164,14 @@ before enabling the new DLL if you want to restore the PV console. It cannot rec
 
 ## Development
 
-- Bridge tests run anywhere, without Xen: `python scripts/test_xenkd_bridge.py`.
+- Bridge tests run anywhere with CFFI installed, without Xen: `python -I scripts/test_xenkd_bridge.py`.
+- Copy the scissored section of `xenkd/xenkd_shm.h` verbatim into the bridge's unindented `SHM_CDEF`. It contains
+  declarations and literal integer defines directly accepted by CFFI 1.9.1. When the header is present, tests require
+  the entire section to match, including comments, and compare geometry constants. Other tests retain an independent
+  byte layout and check sizes and field offsets. Shared-memory code accesses fields by name and reads constants
+  from CFFI's library namespace rather than defining separate Python values.
+- The bridge's `IOREQ_CDEF` mirrors the constants and request structure in `include/xen/hvm/ioreq.h`, including its
+  bitfields. Tests compare that block when the Xen header is present and independently check its byte layout.
 
 ## Limitations
 

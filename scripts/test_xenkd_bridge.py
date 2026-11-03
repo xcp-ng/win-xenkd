@@ -5,11 +5,11 @@ bytearray that stands in for guest memory.
 Run with `python3 test_xenkd_bridge.py` from anywhere.
 """
 
-import ctypes
 import errno
 import importlib.util
 import os
 import random
+import re
 import struct
 import types
 import unittest
@@ -31,6 +31,37 @@ TX_OFFSET = PAGE_SIZE
 RX_OFFSET = PAGE_SIZE + TX_SLOTS * SLOT_SIZE
 BASE_GFN = 0x1000
 DOMID = "7"
+SHM_HEADER_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "xenkd", "xenkd_shm.h"
+)
+IOREQ_HEADER_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "include",
+    "xen",
+    "hvm",
+    "ioreq.h",
+)
+
+# Independent wire offsets: the fake guest must catch a mistake in the bridge's CFFI declarations.
+SHM_SIGNATURE_OFFSET = 0x000
+SHM_GENERATION_OFFSET = 0x004
+SHM_GFN_OFFSET = 0x008
+SHM_TX_PROD = 0x400
+SHM_TX_CONS = 0x440
+SHM_RX_PROD = 0x480
+SHM_RX_CONS = 0x4C0
+SHM_DOM0_GENERATION = 0x500
+SHM_DOM0_HEARTBEAT = 0x504
+
+# Independent Xen x86 wire layout. These flags are encoded bits, not the C direction bitfield's 0/1 values.
+IOREQ_WIRE = struct.Struct("<QQIIIHBB")
+IOREQ_STATE_OFFSET = 30
+IOREQ_READY = 1
+IOREQ_INPROCESS = 2
+IORESP_READY = 3
+IOREQ_READ = 0x20
+IOREQ_DATA_IS_PTR = 0x10
+IOREQ_TYPE_PIO = 0
 
 
 class FakeGuest:
@@ -38,6 +69,8 @@ class FakeGuest:
 
     def __init__(self, generation=0x1234):
         self.memory = bytearray((PAGES + 2) * PAGE_SIZE)
+        # CFFI 1.9.1 accepts bytearray in from_buffer(), but not arbitrary memoryviews.
+        self.cdata = bridge.ffi.from_buffer(self.memory)
         # The area starts a page in, as it would inside XENKD_ADAPTER.
         self.area = memoryview(self.memory)[PAGE_SIZE : (PAGES + 1) * PAGE_SIZE]
         self.words = self.area.cast("I")
@@ -53,46 +86,44 @@ class FakeGuest:
 
     def initialize(self, generation):
         """XenKdInitializeShm."""
-        self.set(bridge.SHM_SIGNATURE_OFFSET, 0)
+        self.set(SHM_SIGNATURE_OFFSET, 0)
         self.area[0:PAGE_SIZE] = bytes(PAGE_SIZE)
         for index, gfn in enumerate(self.ring_gfns):
-            struct.pack_into(
-                "<Q", self.area, bridge.SHM_GFN_OFFSET + 8 * index, gfn
-            )
+            struct.pack_into("<Q", self.area, SHM_GFN_OFFSET + 8 * index, gfn)
         self.generation = generation
-        self.set(bridge.SHM_GENERATION_OFFSET, generation)
-        self.set(bridge.SHM_SIGNATURE_OFFSET, bridge.SHM_SIGNATURE)
+        self.set(SHM_GENERATION_OFFSET, generation)
+        self.set(SHM_SIGNATURE_OFFSET, bridge.cdefs.XENKD_SHM_SIGNATURE)
 
     def shutdown(self):
-        self.set(bridge.SHM_SIGNATURE_OFFSET, 0)
-        self.set(bridge.SHM_GENERATION_OFFSET, 0)
+        self.set(SHM_SIGNATURE_OFFSET, 0)
+        self.set(SHM_GENERATION_OFFSET, 0)
 
     def announce(self):
         return BASE_GFN + 1
 
     @property
     def attached(self):
-        return self.get(bridge.SHM_DOM0_GENERATION) == self.generation
+        return self.get(SHM_DOM0_GENERATION) == self.generation
 
     def send(self, frame):
         """XenKdSendFrame, without the wait: False if the TX ring is full."""
-        prod = self.get(bridge.SHM_TX_PROD)
-        if (prod - self.get(bridge.SHM_TX_CONS)) & 0xFFFFFFFF >= TX_SLOTS:
+        prod = self.get(SHM_TX_PROD)
+        if (prod - self.get(SHM_TX_CONS)) & 0xFFFFFFFF >= TX_SLOTS:
             return False
         offset = TX_OFFSET + (prod % TX_SLOTS) * SLOT_SIZE
         self.set(offset, len(frame))
         self.area[offset + 4 : offset + 4 + len(frame)] = frame
-        self.set(bridge.SHM_TX_PROD, prod + 1)
+        self.set(SHM_TX_PROD, prod + 1)
         return True
 
     def receive(self):
         """XenKdReceiveFrame: the next frame, or None."""
-        cons = self.get(bridge.SHM_RX_CONS)
-        if cons == self.get(bridge.SHM_RX_PROD):
+        cons = self.get(SHM_RX_CONS)
+        if cons == self.get(SHM_RX_PROD):
             return None
         offset = RX_OFFSET + (cons % RX_SLOTS) * SLOT_SIZE
         frame = bytes(self.area[offset + 4 : offset + 4 + self.get(offset)])
-        self.set(bridge.SHM_RX_CONS, cons + 1)
+        self.set(SHM_RX_CONS, cons + 1)
         return frame
 
 
@@ -104,6 +135,7 @@ class FakeMemory:
         self.mapped = 0
         self.closed = False
         self.ioreq = bytearray(PAGE_SIZE)
+        self.ioreq_cdata = bridge.ffi.from_buffer(self.ioreq)
         self.resource_mapped = False
         self.map_calls = []
         self.mappings = {}
@@ -111,7 +143,7 @@ class FakeMemory:
 
     def map_ioreq(self, domid, server_id):
         self.resource_mapped = True
-        return 17, memoryview(self.ioreq)
+        return 17, bridge.ffi.cast("ioreq_t *", self.ioreq_cdata)
 
     def unmap_ioreq(self, resource):
         assert resource == 17
@@ -127,15 +159,16 @@ class FakeMemory:
         else:
             raise OSError(14, "cannot map PFNs %s" % gfns)
         self.mapped += 1
-        address = object()
-        self.mappings[address] = count
+        address = bridge.ffi.cast("void *", self.guest.cdata + first * PAGE_SIZE)
+        # Two retained header maps can refer to the same fake address during a generation change.
+        self.mappings[id(address)] = count
         view = memoryview(self.guest.memory)[
             first * PAGE_SIZE : (first + count) * PAGE_SIZE
         ]
         return address, view
 
     def unmap(self, address, pages):
-        assert self.mappings.pop(address) == pages
+        assert self.mappings.pop(id(address)) == pages
         self.unmap_calls.append(pages)
         self.mapped -= 1
 
@@ -149,6 +182,67 @@ class FakeDomain:
 
 def frame(number, length=100):
     return bytes([number & 0xFF]) * length
+
+
+class SharedLayoutTest(unittest.TestCase):
+    @unittest.skipUnless(os.path.isfile(SHM_HEADER_PATH), "source header not present")
+    def test_declarations_match_header(self):
+        with open(SHM_HEADER_PATH, encoding="utf-8-sig") as source:
+            header = source.read()
+        declarations = bridge.SHM_CDEF
+        section = re.search(r"// ----8<----\n(.*?)// ---->8----", header, re.S)
+        self.assertIsNotNone(section, "missing scissored shared-memory declarations")
+        self.assertEqual(declarations, "\n" + section.group(1))
+        for name in (
+            "SIGNATURE",
+            "SLOT_SIZE",
+            "TX_SLOTS",
+            "RX_SLOTS",
+            "RING_PAGES",
+        ):
+            constant_name = "XENKD_SHM_" + name
+            constant = re.search(
+                r"#define " + constant_name + r"\s+(0[xX][0-9a-fA-F]+|\d+)", header
+            )
+            self.assertIsNotNone(constant, name)
+            self.assertEqual(
+                int(constant.group(1), 0), getattr(bridge.cdefs, constant_name), name
+            )
+
+    def test_wire_layout(self):
+        self.assertEqual(bridge.cdefs.XENKD_SHM_SIGNATURE, 0x02444B58)
+        self.assertEqual(bridge.ffi.sizeof("XENKD_SHM_HEADER"), PAGE_SIZE)
+        self.assertEqual(bridge.cdefs.XENKD_SHM_SLOT_SIZE, SLOT_SIZE)
+        self.assertEqual(bridge.cdefs.XENKD_SHM_TX_SLOTS, TX_SLOTS)
+        self.assertEqual(bridge.cdefs.XENKD_SHM_RX_SLOTS, RX_SLOTS)
+        self.assertEqual(bridge.cdefs.XENKD_SHM_RING_PAGES, PAGES - 1)
+        self.assertEqual(
+            (bridge.cdefs.XENKD_SHM_TX_SLOTS + bridge.cdefs.XENKD_SHM_RX_SLOTS)
+            * bridge.cdefs.XENKD_SHM_SLOT_SIZE,
+            bridge.cdefs.XENKD_SHM_RING_PAGES * PAGE_SIZE,
+        )
+        self.assertEqual(bridge.ffi.sizeof("XENKD_SHM"), PAGES * PAGE_SIZE)
+        for name in ("XENKD_SHM_HEADER", "XENKD_SHM_SLOT", "XENKD_SHM"):
+            self.assertEqual(
+                bridge.ffi.typeof("P" + name).item, bridge.ffi.typeof(name)
+            )
+        for name, offset in (
+            ("Signature", SHM_SIGNATURE_OFFSET),
+            ("Generation", SHM_GENERATION_OFFSET),
+            ("RingGfn", SHM_GFN_OFFSET),
+            ("Reserved1", 0x0C8),
+            ("TxProd", SHM_TX_PROD),
+            ("TxCons", SHM_TX_CONS),
+            ("RxProd", SHM_RX_PROD),
+            ("RxCons", SHM_RX_CONS),
+            ("Dom0Generation", SHM_DOM0_GENERATION),
+            ("Dom0Heartbeat", SHM_DOM0_HEARTBEAT),
+            ("Reserved6", 0x508),
+        ):
+            self.assertEqual(bridge.ffi.offsetof("XENKD_SHM_HEADER", name), offset)
+        self.assertEqual(bridge.ffi.offsetof("XENKD_SHM_SLOT", "Data"), 4)
+        self.assertEqual(bridge.ffi.offsetof("XENKD_SHM", "Tx"), TX_OFFSET)
+        self.assertEqual(bridge.ffi.offsetof("XENKD_SHM", "Rx"), RX_OFFSET)
 
 
 class SharedRingsTest(unittest.TestCase):
@@ -166,11 +260,11 @@ class SharedRingsTest(unittest.TestCase):
 
     def test_attach(self):
         # Frames from before dom0 attached are stale: dropped.
-        self.guest.set(bridge.SHM_TX_PROD, 5)
-        self.guest.set(bridge.SHM_RX_CONS, 9)
+        self.guest.set(SHM_TX_PROD, 5)
+        self.guest.set(SHM_RX_CONS, 9)
         self.attach()
-        self.assertEqual(self.guest.get(bridge.SHM_TX_CONS), 5)
-        self.assertEqual(self.guest.get(bridge.SHM_RX_PROD), 9)
+        self.assertEqual(self.guest.get(SHM_TX_CONS), 5)
+        self.assertEqual(self.guest.get(SHM_RX_PROD), 9)
         self.assertEqual(self.link.poll(), [])
         # Header and packet rings have independent, retained mappings; the header PFN is never in the payload map.
         self.assertEqual(
@@ -208,7 +302,7 @@ class SharedRingsTest(unittest.TestCase):
         self.guest.send(b"")
         self.assertEqual(self.link.poll(), [])
         self.assertEqual(
-            self.guest.get(bridge.SHM_TX_CONS), self.guest.get(bridge.SHM_TX_PROD)
+            self.guest.get(SHM_TX_CONS), self.guest.get(SHM_TX_PROD)
         )
         self.guest.send(frame(1))
         self.assertEqual(self.link.poll(), [frame(1)])
@@ -216,11 +310,11 @@ class SharedRingsTest(unittest.TestCase):
 
     def test_heartbeat(self):
         self.attach()
-        before = self.guest.get(bridge.SHM_DOM0_HEARTBEAT)
+        before = self.guest.get(SHM_DOM0_HEARTBEAT)
         self.link.poll()
         self.link.poll()
         self.assertEqual(
-            self.guest.get(bridge.SHM_DOM0_HEARTBEAT), (before + 2) & 0xFFFFFFFF
+            self.guest.get(SHM_DOM0_HEARTBEAT), (before + 2) & 0xFFFFFFFF
         )
 
     def test_announce_while_attached(self):
@@ -232,7 +326,7 @@ class SharedRingsTest(unittest.TestCase):
         self.assertEqual(len(self.memory.map_calls), 2)
 
     def test_uninitialized_announce(self):
-        self.guest.set(bridge.SHM_GENERATION_OFFSET, 0)
+        self.guest.set(SHM_GENERATION_OFFSET, 0)
         self.link.announce(DOMID, self.guest.announce())
         self.assertFalse(self.link.attached)
         self.assertEqual(self.memory.mapped, 0)
@@ -258,11 +352,11 @@ class SharedRingsTest(unittest.TestCase):
 
     def test_bad_signature(self):
         for signature in (
-            0, 0x53444B58, bridge.SHM_SIGNATURE ^ 1,
-            bridge.SHM_SIGNATURE ^ (1 << 24),
+            0, 0x53444B58, bridge.cdefs.XENKD_SHM_SIGNATURE ^ 1,
+            bridge.cdefs.XENKD_SHM_SIGNATURE ^ (1 << 24),
         ):
             with self.subTest(signature=signature):
-                self.guest.set(bridge.SHM_SIGNATURE_OFFSET, signature)
+                self.guest.set(SHM_SIGNATURE_OFFSET, signature)
                 self.link.announce(DOMID, self.guest.announce())
                 self.assertFalse(self.link.attached)
                 self.assertEqual(self.memory.mapped, 0)
@@ -271,7 +365,7 @@ class SharedRingsTest(unittest.TestCase):
         for gfn in (self.guest.announce(), self.guest.ring_gfns[1]):
             with self.subTest(gfn=gfn):
                 self.guest.initialize(0x1234)
-                struct.pack_into("<Q", self.guest.area, bridge.SHM_GFN_OFFSET, gfn)
+                struct.pack_into("<Q", self.guest.area, SHM_GFN_OFFSET, gfn)
                 self.link.announce(DOMID, self.guest.announce())
                 self.assertFalse(self.link.attached)
                 self.assertEqual(self.memory.mapped, 0)
@@ -294,6 +388,26 @@ class SharedRingsTest(unittest.TestCase):
         self.assertEqual(self.memory.mapped, 0)
         self.assertEqual(self.memory.unmap_calls, [1])
 
+    def test_short_mapping_rejected_before_pointer_access(self):
+        original = self.memory.map
+        for pages in (1, PAGES - 1):
+            with self.subTest(pages=pages):
+                self.guest.initialize(0x1234)
+
+                def short_map(domid, gfns):
+                    address, view = original(domid, gfns)
+                    if len(gfns) == pages:
+                        short = view[:-1]
+                        view.release()
+                        return address, short
+                    return address, view
+
+                with mock.patch.object(self.memory, "map", side_effect=short_map):
+                    self.link.announce(DOMID, self.guest.announce())
+                self.assertFalse(self.link.attached)
+                self.assertFalse(self.guest.attached)
+                self.assertEqual(self.memory.mapped, 0)
+
     def test_header_changes_during_ring_map(self):
         original = self.memory.map
         for field in ("signature", "generation", "pfns"):
@@ -304,14 +418,14 @@ class SharedRingsTest(unittest.TestCase):
                     mapping = original(domid, gfns)
                     if len(gfns) > 1:
                         if field == "signature":
-                            self.guest.set(bridge.SHM_SIGNATURE_OFFSET, 0)
+                            self.guest.set(SHM_SIGNATURE_OFFSET, 0)
                         elif field == "generation":
-                            self.guest.set(bridge.SHM_GENERATION_OFFSET, 0x5678)
+                            self.guest.set(SHM_GENERATION_OFFSET, 0x5678)
                         else:
                             struct.pack_into(
                                 "<Q",
                                 self.guest.area,
-                                bridge.SHM_GFN_OFFSET,
+                                SHM_GFN_OFFSET,
                                 self.guest.ring_gfns[0] + 1,
                             )
                     return mapping
@@ -319,7 +433,7 @@ class SharedRingsTest(unittest.TestCase):
                 with mock.patch.object(self.memory, "map", side_effect=change_header):
                     self.link.announce(DOMID, self.guest.announce())
                 self.assertFalse(self.link.attached)
-                self.assertEqual(self.guest.get(bridge.SHM_DOM0_GENERATION), 0)
+                self.assertEqual(self.guest.get(SHM_DOM0_GENERATION), 0)
                 self.assertEqual(self.memory.mapped, 0)
                 self.assertEqual(self.memory.unmap_calls[-2:], [PAGES - 1, 1])
 
@@ -388,13 +502,13 @@ class SharedRingsTest(unittest.TestCase):
     def test_signature_invalidation(self):
         self.attach()
         # Signature alone invalidates the mapping, before Generation is cleared or changed.
-        self.guest.set(bridge.SHM_SIGNATURE_OFFSET, 0)
+        self.guest.set(SHM_SIGNATURE_OFFSET, 0)
         self.assertEqual(self.link.poll(), [])
         self.assertFalse(self.link.attached)
         self.assertEqual(self.memory.mapped, 0)
         # Once invalidated, even the detach path must stop writing into the header.
         self.assertEqual(
-            self.guest.get(bridge.SHM_DOM0_GENERATION), self.guest.generation
+            self.guest.get(SHM_DOM0_GENERATION), self.guest.generation
         )
 
     def test_guest_shutdown(self):
@@ -416,13 +530,13 @@ class SharedRingsTest(unittest.TestCase):
     def test_bad_indices(self):
         self.attach()
         self.guest.set(
-            bridge.SHM_TX_PROD, self.guest.get(bridge.SHM_TX_PROD) + TX_SLOTS + 1
+            SHM_TX_PROD, self.guest.get(SHM_TX_PROD) + TX_SLOTS + 1
         )
         self.assertEqual(self.link.poll(), [])
         self.assertFalse(self.link.attached)
 
         self.attach()
-        self.guest.set(bridge.SHM_RX_CONS, self.guest.get(bridge.SHM_RX_CONS) + 1)
+        self.guest.set(SHM_RX_CONS, self.guest.get(SHM_RX_CONS) + 1)
         self.link.send(frame(1))
         self.assertFalse(self.link.attached)
 
@@ -440,6 +554,169 @@ class SharedRingsTest(unittest.TestCase):
         self.assertFalse(self.guest.attached)
         self.assertEqual(self.memory.mapped, 0)
         self.assertTrue(self.memory.closed)
+
+
+class ForeignMemoryTest(unittest.TestCase):
+    def setUp(self):
+        # Exercise native flag use even on Windows, where mmap doesn't expose PROT_*.
+        flags = types.SimpleNamespace(PROT_READ=0x10, PROT_WRITE=0x40)
+        patch = mock.patch.object(bridge, "mmap", flags)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.lib = mock.Mock()
+        self.handle = bridge.ffi.cast("xenforeignmemory_handle *", 1)
+        self.resource = bridge.ffi.cast("xenforeignmemory_resource_handle *", 2)
+        self.lib.xenforeignmemory_open.return_value = self.handle
+        self.lib.xenforeignmemory_unmap.return_value = 0
+        self.lib.xenforeignmemory_unmap_resource.return_value = 0
+        patch = mock.patch.object(bridge, "xen_library", return_value=self.lib)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.memory = bridge.ForeignMemory()
+        self.addCleanup(self.memory.close)
+
+    def test_mapping_is_writable_without_copying(self):
+        raw = bridge.ffi.new("unsigned char[]", 2 * PAGE_SIZE)
+        gfns = [BASE_GFN + 4, BASE_GFN + 19]
+
+        def map_pages(handle, domid, prot, pages, array, errors):
+            self.assertEqual(handle, self.handle)
+            self.assertEqual((domid, prot, pages), (int(DOMID), 0x50, 2))
+            self.assertEqual(list(array), gfns)
+            self.assertEqual(list(errors), [0, 0])
+            return raw
+
+        self.lib.xenforeignmemory_map.side_effect = map_pages
+        address, view = self.memory.map(DOMID, gfns)
+        words = view.cast("I")
+        words[PAGE_SIZE // 4] = 0x12345678
+        self.assertEqual(
+            bytes(bridge.ffi.buffer(raw + PAGE_SIZE, 4)), b"\x78\x56\x34\x12"
+        )
+        raw[0] = 0xA5
+        self.assertEqual(view[0], 0xA5)
+        words.release()
+        view.release()
+        self.memory.unmap(address, 2)
+        self.lib.xenforeignmemory_unmap.assert_called_once_with(self.handle, raw, 2)
+
+    def test_page_error_releases_mapping(self):
+        raw = bridge.ffi.new("unsigned char[]", 2 * PAGE_SIZE)
+
+        def map_pages(handle, domid, prot, pages, array, errors):
+            errors[1] = -errno.EACCES
+            return raw
+
+        self.lib.xenforeignmemory_map.side_effect = map_pages
+        with self.assertRaises(OSError) as raised:
+            self.memory.map(DOMID, [BASE_GFN, BASE_GFN + 3])
+        self.assertEqual(raised.exception.errno, errno.EACCES)
+        self.lib.xenforeignmemory_unmap.assert_called_once_with(self.handle, raw, 2)
+
+    def test_null_mapping_reports_ffi_errno(self):
+        def map_pages(*args):
+            bridge.ffi.errno = errno.ENOMEM
+            return bridge.ffi.NULL
+
+        self.lib.xenforeignmemory_map.side_effect = map_pages
+        with self.assertRaises(OSError) as raised:
+            self.memory.map(DOMID, [BASE_GFN])
+        self.assertEqual(raised.exception.errno, errno.ENOMEM)
+        self.lib.xenforeignmemory_unmap.assert_not_called()
+
+    def test_resource_mapping_uses_output_pointer(self):
+        raw = bridge.ffi.new("unsigned char[]", PAGE_SIZE)
+
+        def map_resource(
+            handle, domid, kind, server, frame, pages, address, prot, flags
+        ):
+            self.assertEqual(handle, self.handle)
+            self.assertEqual(
+                (domid, kind, server, frame, pages, prot, flags),
+                (int(DOMID), 0, 7, 1, 1, 0x50, 0),
+            )
+            self.assertEqual(address[0], bridge.ffi.NULL)
+            address[0] = raw
+            return self.resource
+
+        self.lib.xenforeignmemory_map_resource.side_effect = map_resource
+        resource, requests = self.memory.map_ioreq(int(DOMID), 7)
+        requests[0].vp_eport = 0x1234
+        self.assertEqual(bytes(bridge.ffi.buffer(raw + 24, 4)), b"\x34\x12\x00\x00")
+        self.memory.unmap_ioreq(resource)
+        self.lib.xenforeignmemory_unmap_resource.assert_called_once_with(
+            self.handle, self.resource
+        )
+
+    def test_null_resource_reports_ffi_errno(self):
+        def map_resource(*args):
+            bridge.ffi.errno = errno.EINVAL
+            return bridge.ffi.NULL
+
+        self.lib.xenforeignmemory_map_resource.side_effect = map_resource
+        with self.assertRaises(OSError) as raised:
+            self.memory.map_ioreq(int(DOMID), 7)
+        self.assertEqual(raised.exception.errno, errno.EINVAL)
+        self.lib.xenforeignmemory_unmap_resource.assert_not_called()
+
+
+class IoreqLayoutTest(unittest.TestCase):
+    @unittest.skipUnless(os.path.isfile(IOREQ_HEADER_PATH), "Xen header not present")
+    def test_declarations_match_header(self):
+        with open(IOREQ_HEADER_PATH, encoding="utf-8-sig") as source:
+            header = source.read()
+        section = re.search(
+            r"(#define IOREQ_READ\b.*?typedef struct ioreq ioreq_t;\n)",
+            header,
+            re.S,
+        )
+        self.assertIsNotNone(section, "missing Xen ioreq declarations")
+        self.assertEqual(bridge.IOREQ_CDEF, "\n" + section.group(1))
+
+    def test_layout_and_state_bits_match_xen_wire_format(self):
+        self.assertEqual(bridge.ffi.sizeof("ioreq_t"), IOREQ_WIRE.size)
+        for name, offset in (
+            ("addr", 0),
+            ("data", 8),
+            ("count", 16),
+            ("size", 20),
+            ("vp_eport", 24),
+            ("_pad0", 28),
+            ("type", 31),
+        ):
+            self.assertEqual(bridge.ffi.offsetof("ioreq_t", name), offset)
+        for name, value in (
+            ("STATE_IOREQ_NONE", 0),
+            ("STATE_IOREQ_READY", IOREQ_READY),
+            ("STATE_IOREQ_INPROCESS", IOREQ_INPROCESS),
+            ("STATE_IORESP_READY", IORESP_READY),
+            ("IOREQ_READ", 1),
+            ("IOREQ_WRITE", 0),
+            ("IOREQ_TYPE_PIO", IOREQ_TYPE_PIO),
+        ):
+            self.assertEqual(getattr(bridge.cdefs, name), value, name)
+
+        request = bridge.ffi.new("ioreq_t *")
+        view = memoryview(bridge.ffi.buffer(request, IOREQ_WIRE.size))
+        IOREQ_WIRE.pack_into(
+            view, 0, 0xEC, 0x123456789ABCDEF0, 1, 4, 11, 0x1122, 0xF1, 8
+        )
+        self.assertEqual(request.addr, 0xEC)
+        self.assertEqual(request.data, 0x123456789ABCDEF0)
+        self.assertEqual(request.vp_eport, 11)
+        self.assertEqual(request._pad0, 0x1122)
+        self.assertEqual(request.state, IOREQ_READY)
+        self.assertEqual(request.data_is_ptr, 1)
+        self.assertEqual(request.dir, bridge.cdefs.IOREQ_READ)
+        self.assertEqual(request.df, 1)
+        self.assertEqual(request._pad1, 1)
+        request.state = bridge.cdefs.STATE_IORESP_READY
+        self.assertEqual(view[IOREQ_STATE_OFFSET], 0xF3)
+        request.dir = bridge.cdefs.IOREQ_WRITE
+        self.assertEqual(view[IOREQ_STATE_OFFSET], 0xD3)
+        self.assertEqual(request.type, 8)
+        self.assertEqual(request._pad0, 0x1122)
+        view.release()
 
 
 class IoreqTest(unittest.TestCase):
@@ -473,7 +750,7 @@ class IoreqTest(unittest.TestCase):
 
     def create(self, handle, domid, buffered, server_id):
         self.assertEqual(buffered, 0)
-        ctypes.cast(server_id, ctypes.POINTER(ctypes.c_uint16)).contents.value = 7
+        server_id[0] = 7
         return 0
 
     def enable(self, handle, domid, server_id, enabled):
@@ -481,14 +758,14 @@ class IoreqTest(unittest.TestCase):
         if enabled:
             for cpu in range(2):
                 struct.pack_into(
-                    "<I", self.memory.ioreq, cpu * bridge.IOREQ.size + 24, 11 + cpu
+                    "<I", self.memory.ioreq, cpu * IOREQ_WIRE.size + 24, 11 + cpu
                 )
         return 0
 
     def notify(self, handle, local):
         # Xen consumes the published response when the notified vCPU resumes.
-        offset = (local - 111) * bridge.IOREQ.size + bridge.IOREQ_STATE_OFFSET
-        self.assertEqual(self.memory.ioreq[offset] & 0xF, bridge.IORESP_READY)
+        offset = (local - 111) * IOREQ_WIRE.size + IOREQ_STATE_OFFSET
+        self.assertEqual(self.memory.ioreq[offset] & 0xF, IORESP_READY)
         self.memory.ioreq[offset] &= 0xF0
         return 0
 
@@ -505,20 +782,20 @@ class IoreqTest(unittest.TestCase):
             size=4,
             remote=11 + cpu,
             pad=0,
-            flags=bridge.IOREQ_READY,
-            kind=bridge.IOREQ_TYPE_PIO,
+            flags=IOREQ_READY,
+            kind=IOREQ_TYPE_PIO,
         )
         fields.update(changes)
-        offset = cpu * bridge.IOREQ.size
+        offset = cpu * IOREQ_WIRE.size
         names = ("addr", "data", "count", "size", "remote", "pad", "flags", "kind")
-        bridge.IOREQ.pack_into(
+        IOREQ_WIRE.pack_into(
             self.memory.ioreq, offset, *(fields[name] for name in names)
         )
-        return offset
+        return cpu
 
     def test_registration_and_teardown(self):
         server = self.server(0xE0)
-        self.assertEqual(server.ports, {111: 0, 112: 32})
+        self.assertEqual(server.ports, {111: 0, 112: 1})
         self.dm.xendevicemodel_map_io_range_to_ioreq_server.assert_called_once_with(
             1, int(DOMID), 7, 0, 0xE0, 0xE3
         )
@@ -538,9 +815,9 @@ class IoreqTest(unittest.TestCase):
     def test_close_completes_pending_requests_before_destroy(self):
         server = self.server()
         self.request(server)
-        self.request(server, cpu=1, flags=bridge.IOREQ_INPROCESS | bridge.IOREQ_READ)
+        self.request(server, cpu=1, flags=IOREQ_INPROCESS | IOREQ_READ)
         # A response may have been published just before an exception skipped its notification.
-        self.request(server, cpu=2, flags=bridge.IORESP_READY, data=0x1234)
+        self.request(server, cpu=2, flags=IORESP_READY, data=0x1234)
         notifications = []
 
         def notify(handle, local):
@@ -564,11 +841,11 @@ class IoreqTest(unittest.TestCase):
 
     def test_close_waits_for_response_consumption(self):
         server = self.server()
-        self.request(server, flags=bridge.IOREQ_READY | bridge.IOREQ_READ)
+        self.request(server, flags=IOREQ_READY | IOREQ_READ)
         self.evt.xenevtchn_notify.side_effect = None
 
         def consume(delay):
-            self.assertEqual(self.memory.ioreq[30] & 0xF, bridge.IORESP_READY)
+            self.assertEqual(self.memory.ioreq[30] & 0xF, IORESP_READY)
             self.dm.xendevicemodel_destroy_ioreq_server.assert_not_called()
             self.memory.ioreq[30] &= 0xF0
 
@@ -581,7 +858,7 @@ class IoreqTest(unittest.TestCase):
         server = self.server()
         self.request(server)
         self.evt.xenevtchn_notify.side_effect = None
-        with mock.patch.object(bridge, "IOREQ_DRAIN_TIMEOUT", 0):
+        with mock.patch.object(bridge, "DRAIN_TIMEOUT", 0):
             with mock.patch.object(bridge, "log") as log:
                 server.close()
         log.assert_any_call("timed out waiting for 1 i/o responses to be consumed")
@@ -592,20 +869,20 @@ class IoreqTest(unittest.TestCase):
         self.request(server)
         server.dispatch(0, self.link)
         self.assertTrue(self.link.attached)
-        self.assertEqual(self.memory.ioreq[30] & 0xF, bridge.IORESP_READY)
+        self.assertEqual(self.memory.ioreq[30] & 0xF, IORESP_READY)
         self.request(server, cpu=1, data=bridge.IO_DETACH)
         # The guest must remain stopped throughout unmapping its shared pages.
         unmap = self.memory.unmap
 
         def check_unmap(*args):
-            self.assertEqual(self.memory.ioreq[62] & 0xF, bridge.IOREQ_INPROCESS)
+            self.assertEqual(self.memory.ioreq[62] & 0xF, IOREQ_INPROCESS)
             unmap(*args)
 
         with mock.patch.object(self.memory, "unmap", side_effect=check_unmap):
-            server.dispatch(32, self.link)
+            server.dispatch(1, self.link)
         self.assertFalse(self.link.attached)
         self.assertEqual(self.memory.mapped, 0)
-        self.assertEqual(self.memory.ioreq[62] & 0xF, bridge.IORESP_READY)
+        self.assertEqual(self.memory.ioreq[62] & 0xF, IORESP_READY)
 
     def test_invalid_accesses_complete_without_mapping(self):
         server = self.server()
@@ -615,15 +892,15 @@ class IoreqTest(unittest.TestCase):
             {"count": 0},
             {"addr": server.io_port + 1},
             {"kind": 1},
-            {"flags": bridge.IOREQ_READY | bridge.IOREQ_DATA_IS_PTR},
-            {"flags": bridge.IOREQ_READY | bridge.IOREQ_READ},
+            {"flags": IOREQ_READY | IOREQ_DATA_IS_PTR},
+            {"flags": IOREQ_READY | IOREQ_READ},
         ):
             with self.subTest(changes=changes):
                 self.request(server, **changes)
                 server.dispatch(0, self.link)
                 self.assertFalse(self.link.attached)
                 self.assertEqual(self.memory.mapped, 0)
-                self.assertEqual(self.memory.ioreq[30] & 0xF, bridge.IORESP_READY)
+                self.assertEqual(self.memory.ioreq[30] & 0xF, IORESP_READY)
         self.assertEqual(
             struct.unpack_from("<Q", self.memory.ioreq, 8)[0], bridge.IO_DETACH
         )
@@ -632,7 +909,7 @@ class IoreqTest(unittest.TestCase):
         server = self.server()
 
         def readback():
-            self.request(server, flags=bridge.IOREQ_READY | bridge.IOREQ_READ)
+            self.request(server, flags=IOREQ_READY | IOREQ_READ)
             server.dispatch(0, self.link)
             return struct.unpack_from("<Q", self.memory.ioreq, 8)[0]
 
@@ -645,7 +922,7 @@ class IoreqTest(unittest.TestCase):
         self.assertEqual(readback(), bridge.IO_DETACH)
         self.assertEqual(self.memory.mapped, 0)
         # A rejected map must never echo the requested PFN as success.
-        self.guest.set(bridge.SHM_SIGNATURE_OFFSET, 0)
+        self.guest.set(SHM_SIGNATURE_OFFSET, 0)
         self.request(server)
         server.dispatch(0, self.link)
         self.assertEqual(readback(), bridge.IO_DETACH)
@@ -663,7 +940,7 @@ class IoreqTest(unittest.TestCase):
         self.evt.xenevtchn_unmask.assert_called_once_with(2, 111)
 
     def test_registration_failure_cleans_up(self):
-        ctypes.set_errno(errno.EINVAL)
+        bridge.ffi.errno = errno.EINVAL
         self.dm.xendevicemodel_map_io_range_to_ioreq_server.return_value = -1
         with self.assertRaises(OSError):
             bridge.IoreqServer(DOMID, bridge.DEFAULT_IO_PORT, self.memory)

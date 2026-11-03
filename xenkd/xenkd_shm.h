@@ -1,13 +1,13 @@
 #pragma once
 
-// The protocol between xenkd and the dom0 bridge (scripts/xenkd-bridge.py, whose SHM_* constants and SharedRings
+// The protocol between xenkd and the dom0 bridge (scripts/xenkd-bridge.py, whose SHM_CDEF and SharedRings
 // class mirror this file: change both together).
 //
 // Overview
 // --------
 // xenkd carries KDNET's Ethernet frames through an area of guest memory that dom0 maps directly with
 // xenforeignmemory_map. The area is page-aligned inside the memory KDNET reserves for the module (KdNet->Hardware),
-// and made of XENKD_SHM_PAGES pages:
+// and consists of one header page followed by XENKD_SHM_RING_PAGES ring pages:
 //
 //   page 0             the header (XENKD_SHM_HEADER)
 //   pages 1-16         the TX ring: XENKD_SHM_TX_SLOTS slots, guest to dom0
@@ -25,7 +25,7 @@
 // xenkd writes the header PFN as a scalar 32-bit value to XENKD_DEFAULT_IO_PORT (0xEC), overridden by the hexadecimal
 // XENKD_IOPORT load option. The bridge registers the same four-byte range with a secondary Xen ioreq server.
 // The port identifies rendezvous v1. An incompatible rendezvous protocol uses a different port, configured on both
-// ends. Ring layout compatibility is checked independently with the versioned Signature below.
+// ends. Ring layout compatibility is checked independently with Signature below.
 //
 // xenkd announces at KdInitializeController, then once a second (XENKD_ANNOUNCE_INTERVAL_S) while dom0 is detached.
 // dom0 maps the header, reads its nonzero Generation, then validates and maps the area as described below. A repeated
@@ -102,26 +102,27 @@
 //
 // Compatibility
 // -------------
-// An incompatible ring layout change bumps XENKD_SHM_VERSION, encoded in Signature, on both ends. The I/O rendezvous
-// stays independent. Signature's low 24 bits are "XKD"; the high byte is the version. Zero means invalid.
+// An incompatible ring layout uses a new XENKD_SHM_SIGNATURE on both ends. The complete value identifies the protocol;
+// it is not split into magic and version fields. Zero means invalid. The I/O rendezvous stays independent.
 // Reserved fields are zero. The space after Dom0Heartbeat is kept for a guest-to-dom0 event channel, so that dom0 can
 // wait instead of polling.
 
-#define XENKD_SHM_VERSION 2
-#define XENKD_SHM_SIGNATURE (0x00444B58UL | (XENKD_SHM_VERSION << 24)) // "XKD", then version, in memory.
-
+// Copy the scissored section verbatim into SHM_CDEF in scripts/xenkd-bridge.py.
+// ----8<----
+#define XENKD_SHM_SIGNATURE 0x02444B58 // Shared-memory protocol identifier; zero is invalid.
 #define XENKD_SHM_SLOT_SIZE 2048
 #define XENKD_SHM_TX_SLOTS 32 // Guest to dom0.
 #define XENKD_SHM_RX_SLOTS 16 // dom0 to guest. Few on purpose: a deep queue only fills up with stale retransmissions.
-#define XENKD_SHM_RING_PAGES ((XENKD_SHM_TX_SLOTS + XENKD_SHM_RX_SLOTS) * XENKD_SHM_SLOT_SIZE / PAGE_SIZE)
+#define XENKD_SHM_RING_PAGES 24
 
+// Literal array bounds keep these declarations usable by CFFI 1.9.1. The assertions below check the wire geometry.
 typedef struct _XENKD_SHM_HEADER {
     // Written by the guest. Signature is 0 while the area is (re)initialized or shut down; Generation changes at every
     // KdInitializeController.
     ULONG Signature;
     ULONG Generation;
     ULONG64 RingGfn[XENKD_SHM_RING_PAGES]; // TX pages, then RX pages. Does not include the header.
-    UCHAR Reserved1[0x400 - 0xC8];
+    UCHAR Reserved1[0x338];                // 0x400 - 0xC8.
 
     // Each index in its own cache line.
     ULONG TxProd; // Guest.
@@ -138,42 +139,30 @@ typedef struct _XENKD_SHM_HEADER {
     volatile ULONG Dom0Heartbeat;  // Incremented on every dom0 poll.
 
     // Zero, for a dom0 event channel later on.
-    UCHAR Reserved6[PAGE_SIZE - 0x508];
+    UCHAR Reserved6[0xAF8]; // PAGE_SIZE - 0x508.
 } XENKD_SHM_HEADER, *PXENKD_SHM_HEADER;
-
-C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, Signature) == 0x000);
-C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, Generation) == 0x004);
-C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, RingGfn) == 0x008);
-C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, Reserved1) == 0x0C8);
-C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, TxProd) == 0x400);
-C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, TxCons) == 0x440);
-C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, RxProd) == 0x480);
-C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, RxCons) == 0x4C0);
-C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, Dom0Generation) == 0x500);
-C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, Dom0Heartbeat) == 0x504);
-C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, Reserved6) == 0x508);
-C_ASSERT(sizeof(XENKD_SHM_HEADER) == PAGE_SIZE);
 
 typedef struct _XENKD_SHM_SLOT {
     // Read once and checked by the consumer: the other side may be broken.
     volatile ULONG Length;
-    UCHAR Data[XENKD_SHM_SLOT_SIZE - sizeof(ULONG)];
+    UCHAR Data[2044]; // XENKD_SHM_SLOT_SIZE - sizeof(ULONG).
 } XENKD_SHM_SLOT, *PXENKD_SHM_SLOT;
-
-C_ASSERT(sizeof(XENKD_SHM_SLOT) == XENKD_SHM_SLOT_SIZE);
 
 typedef struct _XENKD_SHM {
     XENKD_SHM_HEADER Header;               // Page 0.
     XENKD_SHM_SLOT Tx[XENKD_SHM_TX_SLOTS]; // Pages 1-16.
     XENKD_SHM_SLOT Rx[XENKD_SHM_RX_SLOTS]; // Pages 17-24.
 } XENKD_SHM, *PXENKD_SHM;
+// ---->8----
 
-#define XENKD_SHM_PAGES (sizeof(XENKD_SHM) / PAGE_SIZE)
+// Detailed field offsets are checked against the CFFI layout by test_xenkd_bridge.py.
+C_ASSERT(sizeof(XENKD_SHM_HEADER) == PAGE_SIZE);
+C_ASSERT(sizeof(XENKD_SHM_SLOT) == XENKD_SHM_SLOT_SIZE);
 
-C_ASSERT(FIELD_OFFSET(XENKD_SHM, Tx) == 1 * PAGE_SIZE);
-C_ASSERT(FIELD_OFFSET(XENKD_SHM, Rx) == 17 * PAGE_SIZE);
-C_ASSERT(sizeof(XENKD_SHM) == 25 * PAGE_SIZE);
-C_ASSERT(XENKD_SHM_RING_PAGES == 24);
-C_ASSERT(XENKD_SHM_PAGES == 1 + XENKD_SHM_RING_PAGES);
-C_ASSERT((XENKD_SHM_TX_SLOTS & (XENKD_SHM_TX_SLOTS - 1)) == 0);
-C_ASSERT((XENKD_SHM_RX_SLOTS & (XENKD_SHM_RX_SLOTS - 1)) == 0);
+// Both rings must be contiguous and fill the mapped pages exactly, with no partial page or trailing padding.
+C_ASSERT(RTL_FIELD_SIZE(XENKD_SHM, Tx) + RTL_FIELD_SIZE(XENKD_SHM, Rx) == XENKD_SHM_RING_PAGES * PAGE_SIZE);
+C_ASSERT(sizeof(XENKD_SHM) == (1 + XENKD_SHM_RING_PAGES) * PAGE_SIZE);
+
+// Slot counts must divide the 32-bit counter range so modulo indexing remains continuous across wraparound.
+C_ASSERT(XENKD_SHM_TX_SLOTS > 0 && (XENKD_SHM_TX_SLOTS & (XENKD_SHM_TX_SLOTS - 1)) == 0);
+C_ASSERT(XENKD_SHM_RX_SLOTS > 0 && (XENKD_SHM_RX_SLOTS & (XENKD_SHM_RX_SLOTS - 1)) == 0);

@@ -16,16 +16,17 @@ It follows the guest across reboots, which change its domid: by its UUID on XAPI
 can repeat, and by its name with xl, where `xl create` gives a new UUID unless the config sets one. A domid, or the
 other of the two, is looked up from the running domain at startup.
 
-Run in dom0 as root. Needs xenstore-read, xenstore-list, libxenforeignmemory, libxendevicemodel and libxenevtchn.
+Run in dom0 as root. Needs CFFI 1.9.1 or later, xenstore-read, xenstore-list, libxenforeignmemory, libxendevicemodel
+and libxenevtchn. The Xen libraries are loaded in ABI mode; no compiler or headers are needed at runtime.
 The I/O port defaults to 0xec; --io-port and the guest's XENKD_IOPORT load option must agree. Its four bytes must be
 reserved in guest ACPI and unused by other virtual hardware. The PV console is left alone.
 """
 
 import argparse
-import ctypes
 import errno
 import hashlib
 import hmac
+import mmap
 import os
 import re
 import select
@@ -36,6 +37,8 @@ import subprocess
 import sys
 import time
 import uuid
+
+from cffi import FFI
 
 # The largest Ethernet frame (without FCS) that xenkd sends or accepts (XENKD_MAX_FRAME).
 MAX_FRAME = 1514
@@ -53,40 +56,14 @@ ACTIVE_PERIOD = 1.0
 # With --fast, how often to check I/O notifications and timeouts again while spinning.
 SPIN_SLICE = 0.001
 
-# The shared area, as laid out in xenkd/xenkd_shm.h: a header page, then the TX ring (guest to dom0) and the RX ring
-# (dom0 to guest). Each slot is a 32-bit length followed by the frame. Indices are free-running 32-bit counters.
+# Xen uses 4 KiB pages; shared-memory geometry and signature come from the CFFI declarations below.
 PAGE_SIZE = 4096
-SHM_VERSION = 2
-SHM_SIGNATURE = 0x00444B58 | (SHM_VERSION << 24)  # "XKD", then version
-SHM_SIGNATURE_OFFSET = 0x000
-SHM_GENERATION_OFFSET = 0x004
-SHM_GFN_OFFSET = 0x008
-SHM_SLOT_SIZE = 2048
-SHM_TX_SLOTS = 32
-SHM_RX_SLOTS = 16
-SHM_RING_PAGES = (SHM_TX_SLOTS + SHM_RX_SLOTS) * SHM_SLOT_SIZE // PAGE_SIZE
-SHM_RX_OFFSET = SHM_TX_SLOTS * SHM_SLOT_SIZE
-SHM_TX_PROD = 0x400
-SHM_TX_CONS = 0x440
-SHM_RX_PROD = 0x480
-SHM_RX_CONS = 0x4C0
-SHM_DOM0_GENERATION = 0x500
-SHM_DOM0_HEARTBEAT = 0x504
 INDEX_MASK = 0xFFFFFFFF
 # Rendezvous v1 (XENKD_DEFAULT_IO_PORT / XENKD_IO_DETACH). A port change is an explicit choice on both ends.
 DEFAULT_IO_PORT = 0xEC
 IO_DETACH = 0xFFFFFFFF
-# Xen public hvm/ioreq.h: one 32-byte request per vCPU, in one shared page.
-IOREQ = struct.Struct("<QQIIIHBB")
-IOREQ_STATE_OFFSET = 30
-IOREQ_READY = 1
-IOREQ_INPROCESS = 2
-IORESP_READY = 3
-IOREQ_READ = 0x20
-IOREQ_DATA_IS_PTR = 0x10
-IOREQ_TYPE_PIO = 0
 # Give Xen time to consume responses before freeing the server and its event channels.
-IOREQ_DRAIN_TIMEOUT = 1.0
+DRAIN_TIMEOUT = 1.0
 
 ETHERTYPE_IPV4 = b"\x08\x00"
 ETHERTYPE_ARP = b"\x08\x06"
@@ -228,54 +205,197 @@ class Domain:
         return max(0.0, self.next_check - time.monotonic())
 
 
+# ABI declarations from include-dom0/{xenforeignmemory,xendevicemodel}.h and include-lib/xenevtchn.h.
+# Keep handles opaque and own mappings explicitly: garbage collection must never decide when a guest can reuse pages.
+ffi = FFI()
+ffi.cdef(
+    """
+    typedef uint16_t domid_t;
+    typedef uint16_t ioservid_t;
+    typedef uint32_t evtchn_port_t;
+    typedef int xenevtchn_port_or_error_t;
+    typedef unsigned long xen_pfn_t;
+    struct xentoollog_logger;
+    typedef struct xenforeignmemory_handle xenforeignmemory_handle;
+    typedef struct xenforeignmemory_resource_handle xenforeignmemory_resource_handle;
+    typedef struct xendevicemodel_handle xendevicemodel_handle;
+    typedef struct xenevtchn_handle xenevtchn_handle;
+
+    xenforeignmemory_handle *xenforeignmemory_open(
+        struct xentoollog_logger *logger, unsigned int open_flags);
+    int xenforeignmemory_close(xenforeignmemory_handle *fmem);
+    void *xenforeignmemory_map(xenforeignmemory_handle *fmem, uint32_t dom,
+        int prot, size_t pages, const xen_pfn_t arr[], int err[]);
+    int xenforeignmemory_unmap(xenforeignmemory_handle *fmem,
+        void *addr, size_t pages);
+    xenforeignmemory_resource_handle *xenforeignmemory_map_resource(
+        xenforeignmemory_handle *fmem, domid_t domid, unsigned int type,
+        unsigned int id, unsigned long frame, unsigned long nr_frames,
+        void **paddr, int prot, int flags);
+    int xenforeignmemory_unmap_resource(xenforeignmemory_handle *fmem,
+        xenforeignmemory_resource_handle *fres);
+
+    xendevicemodel_handle *xendevicemodel_open(
+        struct xentoollog_logger *logger, unsigned int open_flags);
+    int xendevicemodel_close(xendevicemodel_handle *dmod);
+    int xendevicemodel_create_ioreq_server(xendevicemodel_handle *dmod,
+        domid_t domid, int handle_bufioreq, ioservid_t *id);
+    int xendevicemodel_destroy_ioreq_server(xendevicemodel_handle *dmod,
+        domid_t domid, ioservid_t id);
+    int xendevicemodel_set_ioreq_server_state(xendevicemodel_handle *dmod,
+        domid_t domid, ioservid_t id, int enabled);
+    int xendevicemodel_map_io_range_to_ioreq_server(xendevicemodel_handle *dmod,
+        domid_t domid, ioservid_t id, int is_mmio, uint64_t start, uint64_t end);
+
+    xenevtchn_handle *xenevtchn_open(
+        struct xentoollog_logger *logger, unsigned int flags);
+    int xenevtchn_close(xenevtchn_handle *xce);
+    int xenevtchn_fd(xenevtchn_handle *xce);
+    xenevtchn_port_or_error_t xenevtchn_bind_interdomain(
+        xenevtchn_handle *xce, uint32_t domid,
+        evtchn_port_t remote_port);
+    xenevtchn_port_or_error_t xenevtchn_pending(xenevtchn_handle *xce);
+    int xenevtchn_notify(xenevtchn_handle *xce, evtchn_port_t port);
+    int xenevtchn_unmask(xenevtchn_handle *xce, evtchn_port_t port);
+    """
+)
+
+# Constants from include/xen/memory.h and include/xen/hvm/hvm_op.h.
+ffi.cdef(
+    """
+    #define XENMEM_resource_ioreq_server 0
+    #define HVM_IOREQSRV_BUFIOREQ_OFF 0
+    """
+)
+
+# Copied from include/xen/hvm/ioreq.h (MIT; Copyright (c) 2004, Intel Corporation).
+# One request per vCPU in the server's shared page; keep this block identical to the header.
+IOREQ_CDEF = """
+#define IOREQ_READ      1
+#define IOREQ_WRITE     0
+
+#define STATE_IOREQ_NONE        0
+#define STATE_IOREQ_READY       1
+#define STATE_IOREQ_INPROCESS   2
+#define STATE_IORESP_READY      3
+
+#define IOREQ_TYPE_PIO          0 /* pio */
+#define IOREQ_TYPE_COPY         1 /* mmio ops */
+#define IOREQ_TYPE_PCI_CONFIG   2
+#define IOREQ_TYPE_TIMEOFFSET   7
+#define IOREQ_TYPE_INVALIDATE   8 /* mapcache */
+
+/*
+ * VMExit dispatcher should cooperate with instruction decoder to
+ * prepare this structure and notify service OS and DM by sending
+ * virq.
+ *
+ * For I/O type IOREQ_TYPE_PCI_CONFIG, the physical address is formatted
+ * as follows:
+ *
+ * 63....48|47..40|39..35|34..32|31........0
+ * SEGMENT |BUS   |DEV   |FN    |OFFSET
+ */
+struct ioreq {
+    uint64_t addr;          /* physical address */
+    uint64_t data;          /* data (or paddr of data) */
+    uint32_t count;         /* for rep prefixes */
+    uint32_t size;          /* size in bytes */
+    uint32_t vp_eport;      /* evtchn for notifications to/from device model */
+    uint16_t _pad0;
+    uint8_t state:4;
+    uint8_t data_is_ptr:1;  /* if 1, data above is the guest paddr
+                             * of the real data to use. */
+    uint8_t dir:1;          /* 1=read, 0=write */
+    uint8_t df:1;
+    uint8_t _pad1:1;
+    uint8_t type;           /* I/O type */
+};
+typedef struct ioreq ioreq_t;
+"""
+ffi.cdef(IOREQ_CDEF)
+
+# xenkd_shm.h uses Windows types, whose wire widths must be the same on dom0.
+ffi.cdef("typedef uint32_t ULONG; typedef uint64_t ULONG64; typedef uint8_t UCHAR;")
+
+# Keep these constants and declarations identical to xenkd_shm.h. CFFI 1.9.1 accepts the literal integer defines;
+# the header's C_ASSERTs and the independent wire-layout tests verify the array bounds.
+SHM_CDEF = """
+#define XENKD_SHM_SIGNATURE 0x02444B58 // Shared-memory protocol identifier; zero is invalid.
+#define XENKD_SHM_SLOT_SIZE 2048
+#define XENKD_SHM_TX_SLOTS 32 // Guest to dom0.
+#define XENKD_SHM_RX_SLOTS 16 // dom0 to guest. Few on purpose: a deep queue only fills up with stale retransmissions.
+#define XENKD_SHM_RING_PAGES 24
+
+// Literal array bounds keep these declarations usable by CFFI 1.9.1. The assertions below check the wire geometry.
+typedef struct _XENKD_SHM_HEADER {
+    // Written by the guest. Signature is 0 while the area is (re)initialized or shut down; Generation changes at every
+    // KdInitializeController.
+    ULONG Signature;
+    ULONG Generation;
+    ULONG64 RingGfn[XENKD_SHM_RING_PAGES]; // TX pages, then RX pages. Does not include the header.
+    UCHAR Reserved1[0x338];                // 0x400 - 0xC8.
+
+    // Each index in its own cache line.
+    ULONG TxProd; // Guest.
+    UCHAR Reserved2[60];
+    volatile ULONG TxCons; // dom0.
+    UCHAR Reserved3[60];
+    volatile ULONG RxProd; // dom0.
+    UCHAR Reserved4[60];
+    ULONG RxCons; // Guest.
+    UCHAR Reserved5[60];
+
+    // Written by dom0. The guest uses dom0's fields only while Dom0Generation is Generation and Dom0Heartbeat changes.
+    volatile ULONG Dom0Generation; // 0 when detached.
+    volatile ULONG Dom0Heartbeat;  // Incremented on every dom0 poll.
+
+    // Zero, for a dom0 event channel later on.
+    UCHAR Reserved6[0xAF8]; // PAGE_SIZE - 0x508.
+} XENKD_SHM_HEADER, *PXENKD_SHM_HEADER;
+
+typedef struct _XENKD_SHM_SLOT {
+    // Read once and checked by the consumer: the other side may be broken.
+    volatile ULONG Length;
+    UCHAR Data[2044]; // XENKD_SHM_SLOT_SIZE - sizeof(ULONG).
+} XENKD_SHM_SLOT, *PXENKD_SHM_SLOT;
+
+typedef struct _XENKD_SHM {
+    XENKD_SHM_HEADER Header;               // Page 0.
+    XENKD_SHM_SLOT Tx[XENKD_SHM_TX_SLOTS]; // Pages 1-16.
+    XENKD_SHM_SLOT Rx[XENKD_SHM_RX_SLOTS]; // Pages 17-24.
+} XENKD_SHM, *PXENKD_SHM;
+"""
+ffi.cdef(SHM_CDEF)
+# Literal constants are exposed through a library namespace without looking up C symbols. Use the process handle
+# on dom0; an explicit C runtime library also lets the offline tests import this module on Windows.
+cdefs = ffi.dlopen("msvcrt.dll" if os.name == "nt" else None)
+
+
 class ForeignMemory:
     """Guest pages mapped into dom0, through libxenforeignmemory."""
 
-    PROT_READ_WRITE = 3
-    PyBUF_WRITE = 0x200
-
     def __init__(self):
-        lib = ctypes.CDLL("libxenforeignmemory.so.1", use_errno=True)
-        handle = ctypes.c_void_p
-        lib.xenforeignmemory_open.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-        lib.xenforeignmemory_open.restype = handle
-        lib.xenforeignmemory_map.argtypes = [
-            handle,
-            ctypes.c_uint32,  # domid
-            ctypes.c_int,  # prot
-            ctypes.c_size_t,  # pages
-            ctypes.POINTER(ctypes.c_ulong),  # xen_pfn_t arr[]
-            ctypes.POINTER(ctypes.c_int),  # err[]
-        ]
-        lib.xenforeignmemory_map.restype = ctypes.c_void_p
-        lib.xenforeignmemory_unmap.argtypes = [handle, ctypes.c_void_p, ctypes.c_size_t]
-        lib.xenforeignmemory_close.argtypes = [handle]
-        self.lib = lib
-        self.handle = lib.xenforeignmemory_open(None, 0)
+        self.lib = xen_library("xenforeignmemory")
+        self.handle = self.lib.xenforeignmemory_open(ffi.NULL, 0)
         if not self.handle:
-            error = ctypes.get_errno()
-            raise OSError(error, "xenforeignmemory_open: %s" % os.strerror(error))
-
-        # A memoryview straight over the mapping, which ctypes arrays can't give (their format is "<B").
-        self.memory_view = ctypes.pythonapi.PyMemoryView_FromMemory
-        self.memory_view.argtypes = [ctypes.c_void_p, ctypes.c_ssize_t, ctypes.c_int]
-        self.memory_view.restype = ctypes.py_object
+            raise xen_error("xenforeignmemory_open")
 
     def map(self, domid, gfns):
         """Map the guest frames gfns (in this order), writable, and return (address, memoryview). The view is invalid
         once unmap() is called with the address."""
         count = len(gfns)
-        errors = (ctypes.c_int * count)()
+        errors = ffi.new("int[]", count)
         address = self.lib.xenforeignmemory_map(
             self.handle,
             int(domid),
-            self.PROT_READ_WRITE,
+            mmap.PROT_READ | mmap.PROT_WRITE,
             count,
-            (ctypes.c_ulong * count)(*gfns),
+            ffi.new("xen_pfn_t[]", gfns),
             errors,
         )
         if not address:
-            error = ctypes.get_errno()
+            error = ffi.errno
             raise OSError(error, "cannot map guest memory: %s" % os.strerror(error))
         for gfn, error in zip(gfns, errors):
             if error:
@@ -284,56 +404,42 @@ class ForeignMemory:
                 raise OSError(
                     error, "cannot map gfn %x: %s" % (gfn, os.strerror(error))
                 )
-        return address, self.memory_view(address, count * PAGE_SIZE, self.PyBUF_WRITE)
+        return address, memoryview(ffi.buffer(address, count * PAGE_SIZE))
 
     def unmap(self, address, pages):
         self.lib.xenforeignmemory_unmap(self.handle, address, pages)
 
     def map_ioreq(self, domid, server_id):
         """Map Xen's ioreq resource, which is not an ordinary guest GFN when the server is enabled."""
-        fn = self.lib.xenforeignmemory_map_resource
-        fn.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_uint16,
-            ctypes.c_uint,
-            ctypes.c_uint,
-            ctypes.c_ulong,
-            ctypes.c_ulong,
-            ctypes.POINTER(ctypes.c_void_p),
-            ctypes.c_int,
-            ctypes.c_int,
-        ]
-        fn.restype = ctypes.c_void_p
-        address = ctypes.c_void_p()
-        # memory.h: resource_ioreq_server = 0, frame_ioreq(0) = 1 (frame 0 is the buffered ring).
-        resource = fn(
+        address = ffi.new("void **")
+        # memory.h: frame_ioreq(0) = 1 (frame 0 is the buffered ring). CFFI cannot declare function-like macros.
+        resource = self.lib.xenforeignmemory_map_resource(
             self.handle,
             int(domid),
-            0,
+            cdefs.XENMEM_resource_ioreq_server,
             server_id,
             1,
             1,
-            ctypes.byref(address),
-            self.PROT_READ_WRITE,
+            address,
+            mmap.PROT_READ | mmap.PROT_WRITE,
             0,
         )
         if not resource:
             raise xen_error("xenforeignmemory_map_resource")
-        area = self.memory_view(address.value, PAGE_SIZE, self.PyBUF_WRITE)
-        return resource, area
+        return resource, ffi.cast("ioreq_t *", address[0])
 
     def unmap_ioreq(self, resource):
-        fn = self.lib.xenforeignmemory_unmap_resource
-        fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        fn.restype = ctypes.c_int
-        xen_check(fn(self.handle, resource), "xenforeignmemory_unmap_resource")
+        xen_check(
+            self.lib.xenforeignmemory_unmap_resource(self.handle, resource),
+            "xenforeignmemory_unmap_resource",
+        )
 
     def close(self):
         self.lib.xenforeignmemory_close(self.handle)
 
 
 def xen_error(operation):
-    error = ctypes.get_errno()
+    error = ffi.errno
     return OSError(error, "%s: %s" % (operation, os.strerror(error)))
 
 
@@ -343,73 +449,41 @@ def xen_check(result, operation):
     return result
 
 
-def xen_library(name, signatures):
-    lib = ctypes.CDLL("lib%s.so.1" % name, use_errno=True)
-    for suffix, result, args in signatures:
-        fn = getattr(lib, name + "_" + suffix)
-        fn.restype, fn.argtypes = result, args
-    return lib
+def xen_library(name):
+    return ffi.dlopen("lib%s.so.1" % name)
 
 
 class IoreqServer:
     """A secondary emulator for one four-byte rendezvous register. It never acquires guest xenbus bindings."""
 
     def __init__(self, domid, io_port, memory):
-        handle, uint, ushort = ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint16
-        integer, ulonglong = ctypes.c_int, ctypes.c_uint64
         self.domid, self.io_port, self.memory = int(domid), io_port, memory
         self.dm_handle = self.evt_handle = self.server_id = None
-        self.resource = self.area = self.fd = None
+        self.resource = self.requests = self.fd = None
         self.enabled = False
         self.ports = {}
         self.next_bind_check = 0.0
-        self.dm = xen_library(
-            "xendevicemodel",
-            [
-                ("open", handle, [handle, uint]),
-                ("close", integer, [handle]),
-                (
-                    "create_ioreq_server",
-                    integer,
-                    [handle, ushort, integer, ctypes.POINTER(ushort)],
-                ),
-                ("destroy_ioreq_server", integer, [handle, ushort, ushort]),
-                ("set_ioreq_server_state", integer, [handle, ushort, ushort, integer]),
-                (
-                    "map_io_range_to_ioreq_server",
-                    integer,
-                    [handle, ushort, ushort, integer, ulonglong, ulonglong],
-                ),
-            ],
-        )
-        self.evt = xen_library(
-            "xenevtchn",
-            [
-                ("open", handle, [handle, uint]),
-                ("close", integer, [handle]),
-                ("fd", integer, [handle]),
-                ("bind_interdomain", integer, [handle, uint, uint]),
-                ("pending", integer, [handle]),
-                ("notify", integer, [handle, uint]),
-                ("unmask", integer, [handle, uint]),
-            ],
-        )
+        self.dm = xen_library("xendevicemodel")
+        self.evt = xen_library("xenevtchn")
         try:
-            self.dm_handle = self.dm.xendevicemodel_open(None, 0)
+            self.dm_handle = self.dm.xendevicemodel_open(ffi.NULL, 0)
             if not self.dm_handle:
                 raise xen_error("xendevicemodel_open")
-            self.evt_handle = self.evt.xenevtchn_open(None, 0)
+            self.evt_handle = self.evt.xenevtchn_open(ffi.NULL, 0)
             if not self.evt_handle:
                 raise xen_error("xenevtchn_open")
-            server_id = ushort()
+            server_id = ffi.new("ioservid_t *")
             xen_check(
                 self.dm.xendevicemodel_create_ioreq_server(
-                    self.dm_handle, self.domid, 0, ctypes.byref(server_id)
+                    self.dm_handle,
+                    self.domid,
+                    cdefs.HVM_IOREQSRV_BUFIOREQ_OFF,
+                    server_id,
                 ),
                 "xendevicemodel_create_ioreq_server",
             )
-            self.server_id = server_id.value
-            self.resource, self.area = memory.map_ioreq(self.domid, self.server_id)
+            self.server_id = server_id[0]
+            self.resource, self.requests = memory.map_ioreq(self.domid, self.server_id)
             # Xen fills vp_eport only when enabled. Map the range last, once all response paths are ready.
             xen_check(
                 self.dm.xendevicemodel_set_ioreq_server_state(
@@ -437,47 +511,42 @@ class IoreqServer:
             return
         self.next_bind_check = time.monotonic() + 1.0
         bound = set(self.ports.values())
-        for offset in range(0, PAGE_SIZE, IOREQ.size):
-            remote = struct.unpack_from("<I", self.area, offset + 24)[0]
-            if remote and offset not in bound:
+        for cpu in range(PAGE_SIZE // ffi.sizeof("ioreq_t")):
+            remote = self.requests[cpu].vp_eport
+            if remote and cpu not in bound:
                 local = xen_check(
                     self.evt.xenevtchn_bind_interdomain(
                         self.evt_handle, self.domid, remote
                     ),
                     "xenevtchn_bind_interdomain",
                 )
-                self.ports[local] = offset
+                self.ports[local] = cpu
 
-    def dispatch(self, offset, link):
+    def dispatch(self, cpu, link):
         """Complete even unsupported requests so a stray access cannot leave a vCPU blocked."""
-        flags = self.area[offset + IOREQ_STATE_OFFSET]
-        if flags & 0xF != IOREQ_READY:
+        request = self.requests[cpu]
+        if request.state != cdefs.STATE_IOREQ_READY:
             return
-        self.area[offset + IOREQ_STATE_OFFSET] = (flags & 0xF0) | IOREQ_INPROCESS
-        addr, data, count, size, remote, pad, flags, kind = IOREQ.unpack_from(
-            self.area, offset
-        )
+        request.state = cdefs.STATE_IOREQ_INPROCESS
         try:
             scalar = (
-                kind == IOREQ_TYPE_PIO
-                and addr == self.io_port
-                and size == 4
-                and count == 1
-                and not flags & IOREQ_DATA_IS_PTR
+                request.type == cdefs.IOREQ_TYPE_PIO
+                and request.addr == self.io_port
+                and request.size == 4
+                and request.count == 1
+                and not request.data_is_ptr
             )
             if scalar:
-                if flags & IOREQ_READ:
-                    struct.pack_into(
-                        "<Q", self.area, offset + 8, link.accepted_pfn(str(self.domid))
-                    )
+                if request.dir == cdefs.IOREQ_READ:
+                    request.data = link.accepted_pfn(str(self.domid))
                 else:
                     # Keep the issuing vCPU stopped until mapping/unmapping finishes, especially on shutdown.
-                    link.announce(str(self.domid), data & INDEX_MASK)
-            elif flags & IOREQ_READ and not flags & IOREQ_DATA_IS_PTR:
-                struct.pack_into("<Q", self.area, offset + 8, 0xFFFFFFFFFFFFFFFF)
+                    link.announce(str(self.domid), request.data & INDEX_MASK)
+            elif request.dir == cdefs.IOREQ_READ and not request.data_is_ptr:
+                request.data = 0xFFFFFFFFFFFFFFFF
         finally:
             # Aligned fields and x86 TSO: data is visible before the response state and notification.
-            self.area[offset + IOREQ_STATE_OFFSET] = (flags & 0xF0) | IORESP_READY
+            request.state = cdefs.STATE_IORESP_READY
 
     def service(self, link):
         # xenevtchn_pending may block even with O_NONBLOCK on some kernels. Always select before calling it.
@@ -485,11 +554,11 @@ class IoreqServer:
             local = xen_check(
                 self.evt.xenevtchn_pending(self.evt_handle), "xenevtchn_pending"
             )
-            offset = self.ports.get(local)
+            cpu = self.ports.get(local)
             try:
-                if offset is not None:
+                if cpu is not None:
                     try:
-                        self.dispatch(offset, link)
+                        self.dispatch(cpu, link)
                     finally:
                         xen_check(
                             self.evt.xenevtchn_notify(self.evt_handle, local),
@@ -506,29 +575,33 @@ class IoreqServer:
         self.next_bind_check = 0.0
         self.refresh_ports()
         pending = []
-        for local, offset in self.ports.items():
-            flags = self.area[offset + IOREQ_STATE_OFFSET]
-            state = flags & 0xF
-            if state not in (IOREQ_READY, IOREQ_INPROCESS, IORESP_READY):
+        for local, cpu in self.ports.items():
+            request = self.requests[cpu]
+            state = request.state
+            if state not in (
+                cdefs.STATE_IOREQ_READY,
+                cdefs.STATE_IOREQ_INPROCESS,
+                cdefs.STATE_IORESP_READY,
+            ):
                 continue
-            if state != IORESP_READY:
+            if state != cdefs.STATE_IORESP_READY:
                 # Don't attach new rings during exit. An unfinished scalar IN sees a detached register.
-                if flags & IOREQ_READ and not flags & IOREQ_DATA_IS_PTR:
-                    struct.pack_into("<Q", self.area, offset + 8, 0xFFFFFFFFFFFFFFFF)
-                self.area[offset + IOREQ_STATE_OFFSET] = (flags & 0xF0) | IORESP_READY
+                if request.dir == cdefs.IOREQ_READ and not request.data_is_ptr:
+                    request.data = 0xFFFFFFFFFFFFFFFF
+                request.state = cdefs.STATE_IORESP_READY
             xen_check(
                 self.evt.xenevtchn_notify(self.evt_handle, local), "xenevtchn_notify"
             )
-            pending.append(offset)
+            pending.append(cpu)
         if not pending:
             return
         log("completing %d pending i/o requests before exit" % len(pending))
-        deadline = time.monotonic() + IOREQ_DRAIN_TIMEOUT
+        deadline = time.monotonic() + DRAIN_TIMEOUT
         while pending:
             pending = [
-                offset
-                for offset in pending
-                if self.area[offset + IOREQ_STATE_OFFSET] & 0xF
+                cpu
+                for cpu in pending
+                if self.requests[cpu].state != cdefs.STATE_IOREQ_NONE
             ]
             if not pending:
                 break
@@ -561,7 +634,7 @@ class IoreqServer:
             result = self.dm.xendevicemodel_destroy_ioreq_server(
                 self.dm_handle, self.domid, self.server_id
             )
-            if result < 0 and ctypes.get_errno() not in (errno.ESRCH, errno.ENOENT):
+            if result < 0 and ffi.errno not in (errno.ESRCH, errno.ENOENT):
                 log(
                     "cannot destroy ioreq server: %s"
                     % xen_error("destroy_ioreq_server")
@@ -570,9 +643,7 @@ class IoreqServer:
                 log("stopped ioreq server (domain %s)" % self.domid)
             self.server_id = None
             self.enabled = False
-        if self.area is not None:
-            self.area.release()
-            self.area = None
+        self.requests = None
         try:
             if self.resource is not None:
                 self.memory.unmap_ioreq(self.resource)
@@ -592,8 +663,8 @@ class RingError(Exception):
 
 
 class SharedRings:
-    """dom0's end of xenkd's rings (see xenkd/xenkd_shm.h), with separate header and ring buffers. Any buffers work,
-    so this can be tested without a guest.
+    """dom0's end of xenkd's rings (see xenkd/xenkd_shm.h). GuestLink owns the separate header and ring mappings;
+    these pointers are valid only until detach().
 
     x86 is TSO, so aligned 32-bit loads and stores done in program order are all the ordering needed. dom0's own
     indices are kept here, and only written to the header: the guest can't confuse us by changing them.
@@ -602,29 +673,27 @@ class SharedRings:
     def __init__(self, header, area, generation):
         """Attach: the header must still be the one announced with this generation."""
         self.check_header(header, generation)
-        if len(area) != SHM_RING_PAGES * PAGE_SIZE:
-            raise RingError("expected %d ring pages" % SHM_RING_PAGES)
-        self.header = memoryview(header)
-        self.words = words = self.header.cast("I")
-        self.area = memoryview(area)
-        self.data_words = self.area.cast("I")
+        self.expected_signature = cdefs.XENKD_SHM_SIGNATURE
+        self.tx_slots = cdefs.XENKD_SHM_TX_SLOTS
+        self.rx_slots = cdefs.XENKD_SHM_RX_SLOTS
+        self.header = header
+        self.tx = area
+        self.rx = area + self.tx_slots
         self.generation = generation
 
         # Drop anything stale, and rewrite all of our fields before claiming the area, so that a stale write from an
         # earlier attachment is harmless.
-        self.tx_cons = words[SHM_TX_CONS // 4] = words[SHM_TX_PROD // 4]
-        self.rx_prod = words[SHM_RX_PROD // 4] = words[SHM_RX_CONS // 4]
-        self.beats = (words[SHM_DOM0_HEARTBEAT // 4] + 1) & INDEX_MASK
-        words[SHM_DOM0_HEARTBEAT // 4] = self.beats
-        words[SHM_DOM0_GENERATION // 4] = generation
+        self.tx_cons = header.TxCons = header.TxProd
+        self.rx_prod = header.RxProd = header.RxCons
+        self.beats = (header.Dom0Heartbeat + 1) & INDEX_MASK
+        header.Dom0Heartbeat = self.beats
+        header.Dom0Generation = generation
 
     @staticmethod
     def check_header(header, generation):
-        """The versioned signature fixes all geometry; generation identifies this initialization."""
-        if len(header) != PAGE_SIZE:
-            raise RingError("expected one header page")
-        signature, actual_generation = struct.unpack_from("<II", header, 0)
-        if signature != SHM_SIGNATURE:
+        """The complete signature fixes all geometry; generation identifies this initialization."""
+        signature, actual_generation = header.Signature, header.Generation
+        if signature != cdefs.XENKD_SHM_SIGNATURE:
             raise RingError("unsupported shared area signature %08x" % signature)
         if generation == 0 or actual_generation != generation:
             raise RingError(
@@ -634,9 +703,9 @@ class SharedRings:
     def check(self):
         """Make sure the guest still uses the area as announced: called before every batch of writes, to keep the
         window in which we could write into pages Windows has reused as small as possible."""
-        signature = self.words[SHM_SIGNATURE_OFFSET // 4]
-        generation = self.words[SHM_GENERATION_OFFSET // 4]
-        if signature != SHM_SIGNATURE or generation != self.generation:
+        signature = self.header.Signature
+        generation = self.header.Generation
+        if signature != self.expected_signature or generation != self.generation:
             raise RingError(
                 "the guest let go of it (signature %08x, generation %x)"
                 % (signature, generation)
@@ -645,25 +714,26 @@ class SharedRings:
     def receive(self):
         """Heartbeat, and take the frames the guest sent."""
         self.check()
-        words = self.words
+        header = self.header
         self.beats = (self.beats + 1) & INDEX_MASK
-        words[SHM_DOM0_HEARTBEAT // 4] = self.beats
-        prod = words[SHM_TX_PROD // 4]
+        header.Dom0Heartbeat = self.beats
+        prod = header.TxProd
         if prod == self.tx_cons:
             return []
-        if (prod - self.tx_cons) & INDEX_MASK > SHM_TX_SLOTS:
+        tx_slots = self.tx_slots
+        if (prod - self.tx_cons) & INDEX_MASK > tx_slots:
             raise RingError("bad TX producer %d (consumer %d)" % (prod, self.tx_cons))
         frames = []
         while self.tx_cons != prod:
-            offset = (self.tx_cons % SHM_TX_SLOTS) * SHM_SLOT_SIZE
-            length = self.data_words[offset // 4]
+            slot = self.tx[self.tx_cons % tx_slots]
+            length = slot.Length
             if length > MAX_FRAME:
                 raise RingError("the guest sent a frame of %d bytes" % length)
             # Empty slots are skipped, but consumed.
             if length:
-                frames.append(bytes(self.area[offset + 4 : offset + 4 + length]))
+                frames.append(bytes(ffi.buffer(slot.Data, length)))
             self.tx_cons = (self.tx_cons + 1) & INDEX_MASK
-        words[SHM_TX_CONS // 4] = self.tx_cons
+        header.TxCons = self.tx_cons
         return frames
 
     def send(self, frame):
@@ -671,31 +741,29 @@ class SharedRings:
         if len(frame) > MAX_FRAME:
             raise ValueError("%d-byte frame" % len(frame))
         self.check()
-        words = self.words
-        cons = words[SHM_RX_CONS // 4]
+        header = self.header
+        cons = header.RxCons
         pending = (self.rx_prod - cons) & INDEX_MASK
-        if pending > SHM_RX_SLOTS:
+        rx_slots = self.rx_slots
+        if pending > rx_slots:
             raise RingError("bad RX consumer %d (producer %d)" % (cons, self.rx_prod))
-        if pending == SHM_RX_SLOTS:
+        if pending == rx_slots:
             return False
-        offset = SHM_RX_OFFSET + (self.rx_prod % SHM_RX_SLOTS) * SHM_SLOT_SIZE
-        self.area[offset + 4 : offset + 4 + len(frame)] = frame
-        self.data_words[offset // 4] = len(frame)
+        slot = self.rx[self.rx_prod % rx_slots]
+        ffi.buffer(slot.Data, len(frame))[:] = frame
+        slot.Length = len(frame)
         self.rx_prod = (self.rx_prod + 1) & INDEX_MASK
-        words[SHM_RX_PROD // 4] = self.rx_prod
+        header.RxProd = self.rx_prod
         return True
 
     def detach(self):
-        """Tell the guest right away, if the area is still its, and stop using the buffer."""
+        """Tell the guest right away, if the area is still its, and stop using the mappings."""
         try:
             self.check()
-            self.words[SHM_DOM0_GENERATION // 4] = 0
+            self.header.Dom0Generation = 0
         except RingError:
             pass
-        self.words.release()
-        self.header.release()
-        self.data_words.release()
-        self.area.release()
+        self.header = self.tx = self.rx = None
 
 
 class DropCounter:
@@ -750,29 +818,33 @@ class GuestLink:
                 self.detach(str(e))
 
         mappings = []
+        ring_pages = cdefs.XENKD_SHM_RING_PAGES
         try:
             # Retain the header mapping; the PFN array contains only packet-ring pages.
             address, header = self.memory.map(domid, [gfn])
             mappings.append((address, header, 1))
-            generation = struct.unpack_from("<I", header, SHM_GENERATION_OFFSET)[0]
-            SharedRings.check_header(header, generation)
-            gfns = list(
-                struct.unpack_from("<%dQ" % SHM_RING_PAGES, header, SHM_GFN_OFFSET)
-            )
-            if gfn in gfns or len(set(gfns)) != SHM_RING_PAGES:
+            if len(header) != ffi.sizeof("XENKD_SHM_HEADER"):
+                raise RingError("expected one header page")
+            shared_header = ffi.cast("XENKD_SHM_HEADER *", address)
+            generation = shared_header.Generation
+            SharedRings.check_header(shared_header, generation)
+            gfns = list(shared_header.RingGfn)
+            if gfn in gfns or len(set(gfns)) != ring_pages:
                 raise RingError("ring PFNs overlap each other or the header")
             if self.attached:
                 self.detach("the guest announced generation %x" % generation)
             address, area = self.memory.map(domid, gfns)
-            mappings.append((address, area, SHM_RING_PAGES))
+            mappings.append((address, area, ring_pages))
+            if len(area) != ffi.sizeof("XENKD_SHM") - ffi.sizeof("XENKD_SHM_HEADER"):
+                raise RingError("expected %d ring pages" % ring_pages)
             # Both mappings are now live. Validate the retained header again before publishing attachment.
-            SharedRings.check_header(header, generation)
-            current_gfns = list(
-                struct.unpack_from("<%dQ" % SHM_RING_PAGES, header, SHM_GFN_OFFSET)
-            )
+            SharedRings.check_header(shared_header, generation)
+            current_gfns = list(shared_header.RingGfn)
             if current_gfns != gfns:
                 raise RingError("the page list changed while mapping the shared area")
-            rings = SharedRings(header, area, generation)
+            rings = SharedRings(
+                shared_header, ffi.cast("PXENKD_SHM_SLOT", address), generation
+            )
         except BaseException as e:
             for address, view, pages in reversed(mappings):
                 view.release()
@@ -791,7 +863,13 @@ class GuestLink:
         log(
             "attached to the shared area at gfn %x (generation %x, %d ring pages,"
             " %d TX and %d RX slots)"
-            % (gfn, generation, SHM_RING_PAGES, SHM_TX_SLOTS, SHM_RX_SLOTS)
+            % (
+                gfn,
+                generation,
+                ring_pages,
+                cdefs.XENKD_SHM_TX_SLOTS,
+                cdefs.XENKD_SHM_RX_SLOTS,
+            )
         )
 
     def detach(self, reason):
