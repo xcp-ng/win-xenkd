@@ -1,35 +1,22 @@
 #pragma once
 
 #include <ntddk.h>
-#include <stdint.h>
 #include <kdnetshareddata.h>
 #include <kdnetextensibility.h>
 
-#if defined(_M_X64)
-#ifndef __x86_64__
-#define __x86_64__
-#endif
-#else
+#if !defined(_M_X64)
 #error "xenkd only supports x64 HVM guests"
 #endif
-
-#pragma warning(push)
-#pragma warning(disable : 4200 4214)
-
-#define __XEN_INTERFACE_VERSION__ 0x00040800
-#include <xen/public/xen.h>
-#include <xen/public/errno.h>
-#include <xen/public/event_channel.h>
-#include <xen/public/hvm/hvm_op.h>
-#include <xen/public/hvm/params.h>
-#include <xen/public/io/console.h>
-
-#pragma warning(pop)
 
 #include "xenkd_shm.h"
 
 #define PCI_VENDOR_ID_XEN 0x5853
 #define PCI_DEVICE_ID_XENKD 0xC201
+
+// Rendezvous v1: write a 32-bit PFN (all ones detaches), read the accepted PFN (all ones if detached).
+// Keep in sync with DEFAULT_IO_PORT in the bridge.
+#define XENKD_DEFAULT_IO_PORT 0xEC
+#define XENKD_IO_DETACH MAXULONG
 
 // Largest Ethernet frame (without FCS) that KDNET may send or that we accept.
 #define XENKD_MAX_FRAME 1514
@@ -55,10 +42,10 @@ typedef struct _XENKD_TX_BUFFER {
 
 typedef struct _XENKD_ADAPTER {
     PKDNET_SHARED_DATA KdNet;
-    // The PV console, now only used to announce the shared area to dom0.
-    struct xencons_interface *Ring;
-    // Set when the backend needs to be kicked, i.e. after we produced output.
-    BOOLEAN NotifyPending;
+    USHORT IoPort;
+    BOOLEAN Initialized;
+    BOOLEAN RendezvousAccepted;
+    ULONG HeaderPfn;
 
     // The shared area, page-aligned inside ShmSpace.
     PXENKD_SHM Shm;

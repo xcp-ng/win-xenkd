@@ -24,27 +24,39 @@ It's fast:
 │                      │      │ shared │                      │◄────────────►│          │
 │        TX/RX rings ◄─┴──────┼────────┼─► maps & polls       │              └──────────┘
 │                             │ memory │                      │
-│        PV console ──────────┼────────┼─► "xenkd-shm v1 ..." │
+│        OUT 0xEC, PFN ───────┼────────┼─► ioreq server       │
 └─────────────────────────────┘        └──────────────────────┘
 ```
 
 - **Rings.** xenkd reserves a 25-page area inside the memory KDNET gives it: a header page, a 32-slot ring from the
-  guest, and a 16-slot ring to the guest, each slot holding one frame. Both sides poll, so there are no interrupts or
-  event channels to set up (KDNET runs with interrupts off anyway). The layout is in
+  guest, and a 16-slot ring to the guest, each slot holding one frame. Both sides poll the packet rings; the guest
+  needs no interrupts or event-channel bindings. The layout is in
   [xenkd/xenkd_shm.h](xenkd/xenkd_shm.h).
-- **Rendezvous.** While no bridge is attached, xenkd writes one line a second on the PV console:
-  `xenkd-shm v1 gfn=<header frame> gen=<generation>`. The bridge reads the console, maps the header, then maps every
-  page the header lists.
+- **Rendezvous.** While no bridge is attached, xenkd writes the header PFN once a second to I/O port `0xEC` using
+  KDNET's `WRITE_PORT_ULONG`. The bridge registers a secondary Xen ioreq server for `0xEC–0xEF` and retains two
+  mappings: the header page, and the 24 ring pages listed in its `RingGfn[]` array. The header's signature encodes
+  layout version 2, which fixes the slot size and ring counts; its generation identifies the initialization.
+  A `READ_PORT_ULONG` returns the accepted header PFN, or `0xFFFFFFFF` if
+  detached. Without acknowledgement, xenkd starts with its link down and retries later. Writing `0xFFFFFFFF` closes
+  the link: the bridge unmaps before the guest's write completes. The port identifies rendezvous protocol v1; the
+  ring layout has its own version.
 - **Liveness.** The bridge bumps a heartbeat on every poll. Without one for 2 s, xenkd treats the link as down (frames
   are dropped, like a NIC without a cable) and announces itself again. Every re-initialization of KDNET gets a new
   generation, so the bridge never writes into a stale area.
 
-The console carries only that announce line, so xenconsoled's rate limit doesn't matter any more.
+The PV console is not used. The bridge can run alongside `xl console`, xencons and xenbus console logging.
+The default `0xEC–0xEF` range is covered by the Xen HVM DSDT's motherboard reservation. It must remain unused by
+other virtual hardware. To change ports, use `Enable-XenKd.ps1 -IoPort 0x...` in the guest and `--io-port 0x...` on the
+bridge. The guest option is stored as hexadecimal `XENKD_IOPORT=0x...` in BCD loadoptions. The base must be nonzero,
+four-byte aligned and no greater than `0xFFFC`; reserve all four bytes in guest ACPI when choosing another range.
+The version 2 header is incompatible with the earlier layout: update the guest DLL and bridge together. The I/O
+register protocol and default port are unchanged.
 
 ## Requirements
 
-- A Xen host with a dom0 shell as root (developed on XCP-ng), with CPython 3.6 or later and `libxenforeignmemory`. The
-  bridge maps guest memory through CPython's C API, so it doesn't run on PyPy.
+- A Xen host with a dom0 shell as root (developed on XCP-ng), with CPython 3.6 or later, `libxenforeignmemory` (with
+  resource mapping), `libxendevicemodel` and `libxenevtchn`. The bridge maps guest memory through CPython's C API, so
+  it doesn't run on PyPy.
 - A 64-bit Windows HVM guest with the **xenkd PCI device** (vendor `5853`, device `C201`) attached. KDNET picks its
   extensibility module by PCI vendor ID, and xenkd checks that it was loaded for this device.
 - To build: Visual Studio with the WDK.
@@ -68,9 +80,9 @@ This produces `xenkd\x64\Release\kd_08_5853.dll`, test-signed. Only x64 is suppo
    .\Enable-XenKd.ps1 -HostIp <debug host IP> -BootDebug -ComPort 1
    ```
 
-   The script finds the xenkd device, installs the DLL into System32, keeps xencons and xenbus off the PV console, and
-   points the kernel debugger at KDNET with a fixed address (`TARGET_IP=169.254.0.2`, `NO_DHCP`). Add `-WhatIf` to see
-   what it would change first.
+   The script finds the xenkd device, installs the DLL into System32, sets the rendezvous port, and points the kernel
+   debugger at KDNET with a fixed address (`TARGET_IP=169.254.0.2`, `NO_DHCP`). Add `-WhatIf` to see what it would
+   change first.
 3. Reboot.
 
 The DLL is test-signed: winload loads it only while a boot debugger is attached. `-BootDebug` sets up boot debugging
@@ -83,6 +95,7 @@ port when the guest boots, and continue (`g`) at the winload break.
 | `-Port`       | `5364`         | WinDbg's UDP port                                                        |
 | `-Key`        | random         | KDNET encryption key                                                     |
 | `-TargetIp`   | `169.254.0.2`  | The guest's address on the debug link (the bridge's `--guest-ip`)        |
+| `-IoPort`     | `0xEC`         | Rendezvous I/O port; must match the bridge's `--io-port`                 |
 | `-BootDebug`  |                | Also debug bootmgr/winload over serial (needed for the test-signed DLL)  |
 | `-ComPort`    | `1`            | The serial port for `-BootDebug`                                         |
 | `-BaudRate`   | `115200`       | The serial port for `-BootDebug`                                         |
@@ -115,32 +128,34 @@ dom0 stands in for the network. The bridge answers the guest's ARP, sends KDNET'
 ordinary socket, and wraps the replies back into frames. No TAP, bridge or routing is needed: WinDbg only has to reach
 dom0 on one UDP port, and accept packets from it.
 
-| Option                       | Default                    | Meaning                                                    |
-|------------------------------|----------------------------|------------------------------------------------------------|
-| `-d`, `--debugger HOST:PORT` | the guest's `HOST_IP:port` | Where WinDbg runs, overrides the guest's choice            |
-| `--destination IP:PORT`      | `169.254.0.1:5364`         | The guest's `-HostIp` and `-Port`; ignore other traffic    |
-| `--guest-ip IP`              | any                        | The guest's `-TargetIp`; ignore other guest addresses      |
-| `--local-port PORT`          | WinDbg's port              | dom0's port; set it if WinDbg runs in dom0                 |
-| `--fast`                     |                            | Poll continuously while frames flow (see Limitations)      |
-| `-v`, `--verbose`            |                            | Log every frame, and the guest's other console output      |
+| Option                       | Default                    | Meaning                                                  |
+|------------------------------|----------------------------|----------------------------------------------------------|
+| `-d`, `--debugger HOST:PORT` | the guest's `HOST_IP:port` | Where WinDbg runs, overrides the guest's choice          |
+| `--destination IP:PORT`      | `169.254.0.1:5364`         | The guest's `-HostIp` and `-Port`; ignore other traffic  |
+| `--guest-ip IP`              | any                        | The guest's `-TargetIp`; ignore other guest addresses    |
+| `--local-port PORT`          | WinDbg's port              | dom0's port; set it if WinDbg runs in dom0               |
+| `--io-port PORT`             | `0xEC`                     | Rendezvous port; matches the guest's `-IoPort`           |
+| `--fast`                     |                            | Poll continuously while frames flow (see Limitations)    |
+| `-v`, `--verbose`            |                            | Log every frame                                          |
 
 The bridge:
 
 - **attaches** within about a second of KDNET starting, and logs `attached to the shared area at gfn ...`;
-- **survives restarts**: a new bridge reattaches within a few seconds, and the WinDbg session carries on;
+- **survives clean restarts**: a new bridge reattaches within a few seconds, and the WinDbg session carries on;
 - **follows reboots**: it waits for the domain to come back, whatever its new domid, then reattaches;
 - **lets go cleanly** on Ctrl+C or SIGTERM, so the guest notices at once.
 
-Don't run `xl console` on the same domain while the bridge runs: both read the same pty, and the console could swallow
-the announce lines.
+For older console-based installations, `-ClearAll` still undoes the old xencons and xenbus console settings; run it
+before enabling the new DLL if you want to restore the PV console. It cannot recover the previous console log level.
 
 ## Troubleshooting
 
 - **WinDbg never connects.** In the guest, look at `HKLM\SYSTEM\CurrentControlSet\Services\kdnet` for KDNET's init
   status and xenkd's error string (`xenkd: ...`).
-- **The bridge never attaches.** Run with `-v` to see whether announce lines arrive. To check that dom0 can map guest
-  memory at all, run [scripts/xenkd-map-test.py](scripts/xenkd-map-test.py) `<domain>` next to the bridge. It maps the
-  guest's console ring and prints its indices.
+- **The bridge never attaches.** Check that it logs `listening on i/o port 0xec`, that the guest and bridge use the
+  same port, and that both have been updated to the I/O rendezvous. To check guest-memory mapping separately, run
+  [scripts/xenkd-map-test.py](scripts/xenkd-map-test.py) `<domain>` next to the bridge. It maps the guest's console ring
+  and prints its indices.
 - **`guest RX ring full` drops.** These are normal in small numbers: WinDbg retransmits while the guest is busy.
 
 ## Development
@@ -156,6 +171,10 @@ the announce lines.
 - dom0 writes into guest memory that KDNET reserved. If Windows ever reused those pages while the bridge is attached,
   the bridge would corrupt them. The generation check makes that window small, which is acceptable for a debugging
   tool.
+- I/O rendezvous is synchronous. A hung bridge can stall the issuing guest vCPU, including in a debugger callback.
+  Stop the bridge with Ctrl+C or SIGTERM so it destroys its ioreq server. SIGKILL or a process crash can leave a server
+  registered in dom0; restarting the bridge is not guaranteed to recover it. Run only one bridge per guest.
+- The header PFN must fit in 32 bits (below 16 TiB, excluding PFN `0xFFFFFFFF`); other ring PFNs remain 64-bit.
 - Save/restore and live migration are untested.
 - With `--fast`, most of each round trip is spent outside the bridge (in the guest, the network and WinDbg), so a
   faster bridge would gain little. PyPy is no help either: a PyPy build of the bridge managed only 9.0 MB/s.

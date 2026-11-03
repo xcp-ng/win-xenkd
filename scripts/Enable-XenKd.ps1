@@ -5,8 +5,8 @@
 
 .DESCRIPTION
     Finds the Xen debug PCI device (5853:c201), installs the matching xenkd DLL (kd_<class>_5853.dll) from the current
-    directory into System32 if it's there (otherwise it must already be installed), keeps xencons and xenbus off the
-    default console, and configures the boot debug settings to use the device.
+    directory into System32 if it's there (otherwise it must already be installed), and configures the boot debug
+    settings to use the device. The PV console is not needed.
     Takes effect after a reboot.
 
 .PARAMETER HostIp
@@ -34,6 +34,10 @@
     The guest's own address on the debug network (TARGET_IP, with NO_DHCP). xenkd-bridge.py is a fake network that
     doesn't answer DHCP, and a fixed address lets a restarted bridge reach the guest before it says anything (pass the
     same one to its --guest-ip).
+
+.PARAMETER IoPort
+    Rendezvous I/O port, default 0xEC. Sets XENKD_IOPORT in the load options; pass the same value to the bridge's
+    --io-port. All four bytes must be reserved in guest ACPI and unused by other virtual hardware.
 
 .PARAMETER Clear
     Instead of enabling anything, turn kernel and boot debugging off and remove every debug setting this script
@@ -76,6 +80,11 @@ param(
     [Parameter(ParameterSetName = 'BootDebug')]
     [ValidateNotNullOrEmpty()]
     [string]$TargetIp = '169.254.0.2',
+    [Parameter(ParameterSetName = 'Kernel')]
+    [Parameter(ParameterSetName = 'BootDebug')]
+    [ValidateRange(4, 65532)]
+    [ValidateScript({ ($_ -band 3) -eq 0 })]
+    [int]$IoPort = 0xEC,
     [Parameter(Mandatory, ParameterSetName = 'Clear')]
     [switch]$Clear,
     [Parameter(Mandatory, ParameterSetName = 'ClearAll')]
@@ -151,6 +160,7 @@ $HvFlag = 'FORCEHVTONOTSHAREDEBUGDEVICE'
 # KDNET's own settings, which it parses from the load options. winload only generates them when {dbgsettings} is net, so
 # with -BootDebug they're added to loadoptions instead. Without ENCRYPTION_KEY, KDNET fails with bugcheck 0x7E.
 $KdNetOptions = @('HOST_IP=\S*', 'HOST_PORT=\S*', 'ENCRYPTION_KEY=\S*', 'TARGET_IP=\S*', 'NO_DHCP')
+$XenKdOptions = @('XENKD_IOPORT=\S*')
 
 if ($Clear -or $ClearAll) {
     Invoke-Bcdedit @('/debug', 'off')
@@ -159,7 +169,7 @@ if ($Clear -or $ClearAll) {
     Remove-BcdValue '{current}' $KernelBusParams
 
     # Drop only our options from the load options, keeping anything else that's there.
-    Update-LoadOptions -Remove (@($HvFlag) + $KdNetOptions)
+    Update-LoadOptions -Remove (@($HvFlag) + $KdNetOptions + $XenKdOptions)
 
     # Back to the default {dbgsettings}: no transport-specific values left over.
     foreach ($name in @('debugtype', 'debugport', 'baudrate', 'busparams', 'hostip', 'port', 'key')) {
@@ -175,7 +185,7 @@ if ($Clear -or $ClearAll) {
             }
         }
 
-        # Re-enable xencons' default console device.
+        # Compatibility cleanup for installations that used the old PV-console rendezvous.
         Get-PnpDevice | Where-Object { $_.InstanceId -like 'XENCONS\*&DEV_CONSOLE\0' -and $_.Status -eq 'Error' } |
         ForEach-Object {
             Write-Host "Enabling xencons default console $($_.InstanceId)"
@@ -232,28 +242,6 @@ $address = (Get-PnpDeviceProperty -InstanceId $device.InstanceId -KeyName DEVPKE
 $busParams = '{0}.{1}.{2}' -f $bus, ($address -shr 16), ($address -band 0xFFFF)
 Write-Host "PCI location $busParams, KDNET will load $dll"
 
-# xencons must leave the default console to xenkd: disable its default console device (instance "0").
-Get-PnpDevice | Where-Object { $_.InstanceId -like 'XENCONS\*&DEV_CONSOLE\0' } | ForEach-Object {
-    Write-Host "Disabling xencons default console $($_.InstanceId)"
-    Disable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false
-}
-
-# Stop xenbus from logging to the default console: without ConsoleLogLevel, xenbus uses its default of no logging.
-$xenbusParametersKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\xenbus\Parameters'
-if ($null -ne (Get-ItemProperty -LiteralPath $xenbusParametersKey -Name ConsoleLogLevel -ErrorAction Ignore)) {
-    if ($PSCmdlet.ShouldProcess("$xenbusParametersKey\ConsoleLogLevel", 'Remove')) {
-        Remove-ItemProperty -LiteralPath $xenbusParametersKey -Name ConsoleLogLevel
-    }
-}
-
-# With UseConsole at 0, a patched xenbus doesn't acquire the default console at all: no mapping, no event channel
-# binding, and xencons can't get it through xenbus either. Stock xenbus ignores the value.
-if (Test-Path -LiteralPath $xenbusParametersKey) {
-    if ($PSCmdlet.ShouldProcess("$xenbusParametersKey\UseConsole", 'Set to 0')) {
-        Set-ItemProperty -LiteralPath $xenbusParametersKey -Name UseConsole -Type DWord -Value 0
-    }
-}
-
 # Configure the debugger.
 $netArgs = @('/dbgsettings', 'net', "hostip:$HostIp", "port:$Port")
 if ($Key) {
@@ -262,7 +250,7 @@ if ($Key) {
 Invoke-Bcdedit $netArgs
 # KDNET parses TARGET_IP and NO_DHCP from the load options itself, so they work whether or not winload generates the
 # rest. It keeps a TARGET_IP outside 169.254/16 only with an encryption key, which there always is here.
-$loadOptionsToAdd = @($HvFlag, "TARGET_IP=$TargetIp", 'NO_DHCP')
+$loadOptionsToAdd = @($HvFlag, "TARGET_IP=$TargetIp", 'NO_DHCP', ('XENKD_IOPORT=0x{0:X}' -f $IoPort))
 if ($BootDebug) {
     # Read the key back, since bcdedit generates one if -Key wasn't given.
     $netKey = $Key
@@ -295,7 +283,7 @@ else {
 
 # Keep winload from swapping in the Hyper-V synthetic debug device ($HvFlag), and with -BootDebug pass KDNET its net
 # settings and address. Stale KDNET options from an earlier run are replaced (or dropped when no longer wanted).
-Update-LoadOptions -Remove (@($HvFlag) + $KdNetOptions) -Add $loadOptionsToAdd
+Update-LoadOptions -Remove (@($HvFlag) + $KdNetOptions + $XenKdOptions) -Add $loadOptionsToAdd
 
 Invoke-Bcdedit @('/debug', 'on')
 

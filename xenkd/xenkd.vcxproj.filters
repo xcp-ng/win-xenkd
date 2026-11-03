@@ -11,9 +11,6 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="hypercall.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="xenkd.c">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -24,19 +21,11 @@
     </None>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="hypercall.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="xenkd.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="xenkd_shm.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-  </ItemGroup>
-  <ItemGroup>
-    <MASM Include="amd64\hypercall_thunk.asm">
-      <Filter>Source Files</Filter>
-    </MASM>
   </ItemGroup>
 </Project>

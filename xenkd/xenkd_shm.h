@@ -13,41 +13,48 @@
 //   pages 1-16         the TX ring: XENKD_SHM_TX_SLOTS slots, guest to dom0
 //   pages 17-24        the RX ring: XENKD_SHM_RX_SLOTS slots, dom0 to guest
 //
-// The pages aren't physically contiguous: Gfn[] lists the guest frame of each one, and dom0 maps them in that order to
-// see the area as one block. No grant tables, xenstore or event channels are involved (those belong to xenbus.sys),
-// and both sides poll.
+// The pages aren't physically contiguous. dom0 maps the header independently; RingGfn[] lists just the 24 ring pages,
+// which dom0 maps together in that order. The guest uses no grant tables, xenstore or event-channel bindings (those
+// belong to xenbus.sys), and both sides poll. dom0 binds Xen's own ioreq event channels for rendezvous only.
 //
-// All fields are little-endian 32-bit values (64-bit for Gfn[]), naturally aligned, so x86 loads and stores of them
+// All fields are little-endian 32-bit values (64-bit for RingGfn[]), naturally aligned, so x86 loads and stores of them
 // are atomic. Every field has exactly one writer, listed below. Each side treats what the other wrote as untrusted.
 //
 // Rendezvous
 // ----------
-// dom0 learns where the header is from a line that xenkd writes to the PV console ring:
+// xenkd writes the header PFN as a scalar 32-bit value to XENKD_DEFAULT_IO_PORT (0xEC), overridden by the hexadecimal
+// XENKD_IOPORT load option. The bridge registers the same four-byte range with a secondary Xen ioreq server.
+// The port identifies rendezvous v1. An incompatible rendezvous protocol uses a different port, configured on both
+// ends. Ring layout compatibility is checked independently with the versioned Signature below.
 //
-//   \nxenkd-shm v1 gfn=<Gfn[0], lowercase hex> gen=<Generation, lowercase hex>\n
+// xenkd announces at KdInitializeController, then once a second (XENKD_ANNOUNCE_INTERVAL_S) while dom0 is detached.
+// dom0 maps the header, reads its nonzero Generation, then validates and maps the area as described below. A repeated
+// PFN with the same generation leaves an existing attachment alone. The header PFN must be below 0xFFFFFFFF; PFNs of
+// the other pages remain 64-bit. All ones is reserved for shutdown: dom0 unmaps before completing that write.
+// A scalar 32-bit read returns the accepted header PFN, or all ones while detached. xenkd reads back after each
+// announcement and uses the link only after acknowledgement and a matching live heartbeat. No acknowledgement is
+// needed to finish initialization: without a bridge, xenkd starts detached and retries on subsequent KDNET calls.
 //
-// xenkd writes it at KdInitializeController, then once a second (XENKD_ANNOUNCE_INTERVAL_S) for as long as dom0 isn't
-// attached. The line goes into the ring whole or not at all, and xenkd never waits for room: another one follows. A
-// line with the same generation as dom0's current attachment is ignored by dom0, since xenkd may announce once more
-// before it sees dom0's heartbeat.
+// I/O is synchronous when a server owns the port: guest interrupts need not be enabled, but a hung bridge can stall
+// the issuing vCPU. With no server, writes fall through to the device model. The port must have no other handler.
 //
 // Guest initialization (KdInitializeController)
 // ---------------------------------------------
-//   1. Magic = 0, barrier, then zero the whole header page (indices, dom0's fields and reserved space included).
-//   2. Fill Version, PageCount, SlotSize, TxSlots, RxSlots and Gfn[] (from KdGetPhysicalAddress of each page).
+//   1. Signature = 0, barrier, then zero the whole header page (indices, dom0's fields and reserved space included).
+//   2. Fill RingGfn[] from KdGetPhysicalAddress of each ring page; cache the header PFN in the adapter.
 //   3. Generation = a new nonzero value (from the cycle counter), different from the previous one.
-//   4. Barrier, then Magic = XENKD_SHM_MAGIC: the area is now valid.
+//   4. Barrier, then Signature = XENKD_SHM_SIGNATURE: the area is now valid.
 //   5. Announce.
 //
-// At KdShutdownController, xenkd sets Magic and Generation to 0. A new KdInitializeController starts over with a new
-// generation, so a dom0 still attached to the old one notices and lets go.
+// At KdShutdownController, xenkd sets Signature and Generation to 0 and writes all ones to the port. A new
+// initialization starts over with a new generation, so a dom0 still attached to the old one notices and lets go.
 //
 // dom0 attachment
 // ---------------
-//   1. Map Gfn[0] alone, and check the header: Magic, Version, Generation equal to the announced one, a power-of-two
-//      SlotSize between 4 + XENKD_MAX_FRAME and PAGE_SIZE, power-of-two slot counts, and a PageCount of at most
-//      XENKD_SHM_MAX_PAGES that holds the header and both rings.
-//   2. Map Gfn[0..PageCount), check that the first one is the announced frame, and check the header again there.
+//   1. Map the header PFN, check Signature and its nonzero Generation, then read the fixed-length RingGfn[] array.
+//      Reject duplicate PFNs and any ring PFN equal to the header PFN.
+//   2. Map the ring pages separately, then recheck Signature, Generation and RingGfn[] through the retained header
+//      mapping before writing anything. The geometry is fixed by this signature, not supplied by the guest.
 //   3. TxCons = TxProd and RxProd = RxCons, dropping anything stale, then bump Dom0Heartbeat.
 //   4. Dom0Generation = Generation: dom0 is attached. Since every dom0 field was rewritten first, a stale write from
 //      an earlier attachment can't confuse the guest.
@@ -83,43 +90,38 @@
 // is more than a ring ahead. If TxCons is more than a ring behind, it fails the send.
 //
 // dom0 keeps its own indices (TxCons, RxProd) locally and only ever writes them out, so the guest can't change them.
-// Before every batch of writes, it checks that Magic and Generation are still the ones it attached to, which keeps the
-// window in which it could write into pages Windows has reused as small as possible. A TX Length over
+// Before every batch of writes, it checks that Signature and Generation are still the ones it attached to, which keeps
+// the window in which it could write into pages Windows has reused as small as possible. A TX Length over
 // XENKD_MAX_FRAME, or an index more than a ring away from dom0's, means the guest is broken: dom0 detaches.
 //
 // Detaching
 // ---------
-// dom0 detaches when Magic or Generation changes, when the guest breaks the rules above, when the domain goes away,
+// dom0 detaches when Signature or Generation changes, when the guest breaks the rules above, when the domain goes away,
 // and when the bridge exits. If the area is still the one it attached to, it first sets Dom0Generation = 0, so the
 // guest stops using it at once and starts announcing again. Otherwise the guest notices from the heartbeat timeout.
 //
 // Compatibility
 // -------------
-// Any incompatible change bumps XENKD_SHM_VERSION, together with the "v1" of the announce line, which dom0 matches.
+// An incompatible ring layout change bumps XENKD_SHM_VERSION, encoded in Signature, on both ends. The I/O rendezvous
+// stays independent. Signature's low 24 bits are "XKD"; the high byte is the version. Zero means invalid.
 // Reserved fields are zero. The space after Dom0Heartbeat is kept for a guest-to-dom0 event channel, so that dom0 can
 // wait instead of polling.
 
-#define XENKD_SHM_MAGIC 0x53444B58 // "XKDS" in memory.
-#define XENKD_SHM_VERSION 1
+#define XENKD_SHM_VERSION 2
+#define XENKD_SHM_SIGNATURE (0x00444B58UL | (XENKD_SHM_VERSION << 24)) // "XKD", then version, in memory.
 
-#define XENKD_SHM_MAX_PAGES 64
 #define XENKD_SHM_SLOT_SIZE 2048
 #define XENKD_SHM_TX_SLOTS 32 // Guest to dom0.
 #define XENKD_SHM_RX_SLOTS 16 // dom0 to guest. Few on purpose: a deep queue only fills up with stale retransmissions.
+#define XENKD_SHM_RING_PAGES ((XENKD_SHM_TX_SLOTS + XENKD_SHM_RX_SLOTS) * XENKD_SHM_SLOT_SIZE / PAGE_SIZE)
 
 typedef struct _XENKD_SHM_HEADER {
-    // Written by the guest. Magic is 0 while the area is (re)initialized or shut down, and Generation changes at every
+    // Written by the guest. Signature is 0 while the area is (re)initialized or shut down; Generation changes at every
     // KdInitializeController.
-    ULONG Magic;
-    ULONG Version;
+    ULONG Signature;
     ULONG Generation;
-    ULONG PageCount;
-    ULONG SlotSize;
-    ULONG TxSlots;
-    ULONG RxSlots;
-    ULONG Reserved0;
-    ULONG64 Gfn[XENKD_SHM_MAX_PAGES]; // Guest frame of each page of the area, the header's first.
-    UCHAR Reserved1[0x400 - 0x220];
+    ULONG64 RingGfn[XENKD_SHM_RING_PAGES]; // TX pages, then RX pages. Does not include the header.
+    UCHAR Reserved1[0x400 - 0xC8];
 
     // Each index in its own cache line.
     ULONG TxProd; // Guest.
@@ -139,14 +141,10 @@ typedef struct _XENKD_SHM_HEADER {
     UCHAR Reserved6[PAGE_SIZE - 0x508];
 } XENKD_SHM_HEADER, *PXENKD_SHM_HEADER;
 
-C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, Magic) == 0x000);
-C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, Version) == 0x004);
-C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, Generation) == 0x008);
-C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, PageCount) == 0x00C);
-C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, SlotSize) == 0x010);
-C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, TxSlots) == 0x014);
-C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, RxSlots) == 0x018);
-C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, Gfn) == 0x020);
+C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, Signature) == 0x000);
+C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, Generation) == 0x004);
+C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, RingGfn) == 0x008);
+C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, Reserved1) == 0x0C8);
 C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, TxProd) == 0x400);
 C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, TxCons) == 0x440);
 C_ASSERT(FIELD_OFFSET(XENKD_SHM_HEADER, RxProd) == 0x480);
@@ -175,6 +173,7 @@ typedef struct _XENKD_SHM {
 C_ASSERT(FIELD_OFFSET(XENKD_SHM, Tx) == 1 * PAGE_SIZE);
 C_ASSERT(FIELD_OFFSET(XENKD_SHM, Rx) == 17 * PAGE_SIZE);
 C_ASSERT(sizeof(XENKD_SHM) == 25 * PAGE_SIZE);
-C_ASSERT(XENKD_SHM_PAGES <= XENKD_SHM_MAX_PAGES);
+C_ASSERT(XENKD_SHM_RING_PAGES == 24);
+C_ASSERT(XENKD_SHM_PAGES == 1 + XENKD_SHM_RING_PAGES);
 C_ASSERT((XENKD_SHM_TX_SLOTS & (XENKD_SHM_TX_SLOTS - 1)) == 0);
 C_ASSERT((XENKD_SHM_RX_SLOTS & (XENKD_SHM_RX_SLOTS - 1)) == 0);

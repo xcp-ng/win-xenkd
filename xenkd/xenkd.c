@@ -1,12 +1,11 @@
-#include <intrin.h>
-
 #include "xenkd.h"
-#include "hypercall.h"
 
 PKDNET_EXTENSIBILITY_IMPORTS KdNetExtensibilityImports;
 
+static USHORT XenKdIoPort = XENKD_DEFAULT_IO_PORT;
+
 // Without a heartbeat from dom0 for XENKD_DOM0_TIMEOUT_S, it's detached. While detached, the shared area is announced
-// on the console every XENKD_ANNOUNCE_INTERVAL_S.
+// through the I/O port every XENKD_ANNOUNCE_INTERVAL_S.
 #define XENKD_DOM0_TIMEOUT_S 2
 #define XENKD_ANNOUNCE_INTERVAL_S 1
 
@@ -23,20 +22,6 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
     return STATUS_SUCCESS;
 }
 
-static VOID XenKdNotify(_In_ PXENKD_ADAPTER Adapter) {
-    ULONGLONG Port;
-
-    if (!Adapter->NotifyPending)
-        return;
-
-    // Only EVTCHNOP_send is used: it's a plain hypercall and needs no interrupt or binding on our side. The port
-    // isn't cached since xenbus.sys rebinds the console event channel (and updates the param) after EVTCHNOP_reset.
-    if (NT_SUCCESS(HvmGetParameter(HVM_PARAM_CONSOLE_EVTCHN, &Port)) && Port != 0)
-        (VOID) EventChannelSend((ULONG)Port);
-
-    Adapter->NotifyPending = FALSE;
-}
-
 // Report why initialization failed. KDNET stores these in the registry (Services\kdnet) for diagnosis.
 static NTSTATUS XenKdFail(_In_ NTSTATUS Status, _In_ PWCHAR Message) {
     KdNetErrorStatus = Status;
@@ -50,61 +35,71 @@ static ULONG64 XenKdElapsed(_In_ ULONG64 Now, _In_ ULONG64 Since) {
     return Now > Since ? Now - Since : 0;
 }
 
-static ULONG
-XenKdAppendString(_Inout_updates_(Size) PCHAR Line, _In_ ULONG Size, _In_ ULONG Length, _In_z_ PCSTR String) {
-    while (*String != '\0' && Length < Size)
-        Line[Length++] = *String++;
-
-    return Length;
-}
-
-static ULONG XenKdAppendHex(_Inout_updates_(Size) PCHAR Line, _In_ ULONG Size, _In_ ULONG Length, _In_ ULONG64 Value) {
-    LONG Shift;
-
-    // No leading zeros, except for 0 itself.
-    for (Shift = 60; Shift > 0 && (Value >> Shift) == 0; Shift -= 4)
-        ;
-
-    for (; Shift >= 0 && Length < Size; Shift -= 4)
-        Line[Length++] = "0123456789abcdef"[(Value >> Shift) & 0xF];
-
-    return Length;
-}
-
-// Tell dom0 where the shared area is, with a line on the console. The line is written whole or not at all, and never
-// waits: another one follows within XENKD_ANNOUNCE_INTERVAL_S.
+// A scalar OUT needs no guest interrupt or event-channel binding. Xen waits for the bridge to complete it when an
+// ioreq server owns the port; with no server, the unclaimed write falls through to the device model.
 static VOID XenKdAnnounce(_In_ PXENKD_ADAPTER Adapter, _In_ ULONG64 Now) {
-    struct xencons_interface *Ring = Adapter->Ring;
-    PXENKD_SHM_HEADER Header = &Adapter->Shm->Header;
-    CHAR Line[64];
-    ULONG Length;
-    ULONG Index;
-    XENCONS_RING_IDX cons;
-    XENCONS_RING_IDX prod;
-
     Adapter->LastAnnounceTime = Now;
-
-    Length = XenKdAppendString(Line, sizeof(Line), 0, "\nxenkd-shm v1 gfn=");
-    Length = XenKdAppendHex(Line, sizeof(Line), Length, Header->Gfn[0]);
-    Length = XenKdAppendString(Line, sizeof(Line), Length, " gen=");
-    Length = XenKdAppendHex(Line, sizeof(Line), Length, Header->Generation);
-    Length = XenKdAppendString(Line, sizeof(Line), Length, "\n");
-
     KeMemoryBarrier();
-    cons = Ring->out_cons;
-    prod = Ring->out_prod;
-    KeMemoryBarrier();
+    WRITE_PORT_ULONG((PULONG)(ULONG_PTR)Adapter->IoPort, Adapter->HeaderPfn);
+    Adapter->RendezvousAccepted = READ_PORT_ULONG((PULONG)(ULONG_PTR)Adapter->IoPort) == Adapter->HeaderPfn;
+}
 
-    if (prod - cons > sizeof(Ring->out) - Length)
-        return;
+// Hexadecimal load option, parsed without CRT imports. A port change must be made on both ends.
+static NTSTATUS XenKdConfigurePort(_In_opt_z_ PCSTR Options) {
+    PCSTR Name = "XENKD_IOPORT=";
+    PCSTR Word;
+    PCSTR Value;
+    ULONG Index;
+    ULONG Port;
+    ULONG Digits;
+    ULONG Digit;
+    CHAR Ch;
 
-    for (Index = 0; Index < Length; Index++)
-        Ring->out[MASK_XENCONS_IDX(prod + Index, Ring->out)] = Line[Index];
-    KeMemoryBarrier();
-    Ring->out_prod = prod + Length;
+    XenKdIoPort = XENKD_DEFAULT_IO_PORT;
+    while (Options != NULL && *Options != '\0') {
+        if (*Options == ' ' || *Options == '\t' || *Options == '/') {
+            Options++;
+            continue;
+        }
+        Word = Options;
+        while (*Options != '\0' && *Options != ' ' && *Options != '\t' && *Options != '/')
+            Options++;
+        for (Index = 0; Name[Index] != '\0' && Word + Index < Options; Index++) {
+            Ch = Word[Index];
+            if (Ch >= 'a' && Ch <= 'z')
+                Ch -= 'a' - 'A';
+            if (Ch != Name[Index])
+                break;
+        }
+        if (Name[Index] != '\0')
+            continue;
 
-    Adapter->NotifyPending = TRUE;
-    XenKdNotify(Adapter);
+        Value = Word + Index;
+        if (Options - Value >= 2 && Value[0] == '0' && (Value[1] == 'x' || Value[1] == 'X'))
+            Value += 2;
+        Port = Digits = 0;
+        while (Value < Options) {
+            Ch = *Value++;
+            if (Ch >= '0' && Ch <= '9')
+                Digit = Ch - '0';
+            else if (Ch >= 'a' && Ch <= 'f')
+                Digit = Ch - 'a' + 10;
+            else if (Ch >= 'A' && Ch <= 'F')
+                Digit = Ch - 'A' + 10;
+            else
+                goto invalid;
+            if (++Digits > 4)
+                goto invalid;
+            Port = (Port << 4) | Digit;
+        }
+        if (Digits == 0 || Port == 0 || Port > 0xFFFC || (Port & 3) != 0)
+            goto invalid;
+        XenKdIoPort = (USHORT)Port;
+    }
+    return STATUS_SUCCESS;
+
+invalid:
+    return XenKdFail(STATUS_INVALID_PARAMETER, L"xenkd: XENKD_IOPORT must be an aligned nonzero hexadecimal I/O port");
 }
 
 // Housekeeping, done on every call from KDNET that may touch the rings: follow dom0's heartbeat, and announce the
@@ -129,7 +124,7 @@ static BOOLEAN XenKdCheckDom0(_In_ PXENKD_ADAPTER Adapter) {
         Adapter->LastHeartbeatTime = Now;
     }
 
-    Attached = Generation == Header->Generation &&
+    Attached = Adapter->RendezvousAccepted && Generation == Header->Generation &&
         XenKdElapsed(Now, Adapter->LastHeartbeatTime) < XENKD_DOM0_TIMEOUT_S * Adapter->TicksPerSecond;
 
     if (!Attached &&
@@ -177,7 +172,7 @@ static NTSTATUS XenKdSendFrame(_In_ PXENKD_ADAPTER Adapter, _In_reads_bytes_(Len
 
     Slot = &Shm->Tx[prod % XENKD_SHM_TX_SLOTS];
     Slot->Length = Length;
-    __movsb(Slot->Data, Data, Length);
+    RtlCopyMemory(Slot->Data, Data, Length);
     KeMemoryBarrier();
     Shm->Header.TxProd = prod + 1;
 
@@ -235,7 +230,7 @@ static ULONG XenKdReceiveFrame(_In_ PXENKD_ADAPTER Adapter) {
     if (Index == XENKD_RX_NONE)
         return XENKD_RX_NONE;
 
-    __movsb(Adapter->Rx[Index].Data, Slot->Data, Length);
+    RtlCopyMemory(Adapter->Rx[Index].Data, Slot->Data, Length);
     Adapter->Rx[Index].Length = Length;
     KeMemoryBarrier();
     Shm->Header.RxCons = cons + 1;
@@ -243,7 +238,7 @@ static ULONG XenKdReceiveFrame(_In_ PXENKD_ADAPTER Adapter) {
     return Index;
 }
 
-// Fill the shared area's header, which dom0 can't attach to until Magic is set.
+// Fill the shared area's header, which dom0 can't attach to until Signature is set.
 static NTSTATUS XenKdInitializeShm(_In_ PXENKD_ADAPTER Adapter) {
     PXENKD_SHM_HEADER Header = &Adapter->Shm->Header;
     PHYSICAL_ADDRESS Address;
@@ -263,23 +258,22 @@ static NTSTATUS XenKdInitializeShm(_In_ PXENKD_ADAPTER Adapter) {
     if (Generation == 0)
         Generation++;
 
-    // Zero the whole header: Magic first, then the indices, dom0's fields and the reserved space.
-    Header->Magic = 0;
+    // Zero the whole header: Signature first, then the indices, dom0's fields and the reserved space.
+    Header->Signature = 0;
     KeMemoryBarrier();
-    __stosb((PUCHAR)Header, 0, sizeof(*Header));
+    RtlZeroMemory(Header, sizeof(*Header));
 
-    Header->Version = XENKD_SHM_VERSION;
-    Header->PageCount = XENKD_SHM_PAGES;
-    Header->SlotSize = XENKD_SHM_SLOT_SIZE;
-    Header->TxSlots = XENKD_SHM_TX_SLOTS;
-    Header->RxSlots = XENKD_SHM_RX_SLOTS;
+    Address = KdGetPhysicalAddress(Adapter->Shm);
+    if (Address.QuadPart == 0 || ((ULONG64)Address.QuadPart >> PAGE_SHIFT) >= XENKD_IO_DETACH)
+        return XenKdFail(STATUS_INVALID_ADDRESS, L"xenkd: invalid shared header PFN for the I/O rendezvous");
+    Adapter->HeaderPfn = (ULONG)((ULONG64)Address.QuadPart >> PAGE_SHIFT);
 
-    for (Index = 0; Index < XENKD_SHM_PAGES; Index++) {
-        Address = KdGetPhysicalAddress((PUCHAR)Adapter->Shm + Index * PAGE_SIZE);
+    for (Index = 0; Index < XENKD_SHM_RING_PAGES; Index++) {
+        Address = KdGetPhysicalAddress((PUCHAR)Adapter->Shm + (Index + 1) * PAGE_SIZE);
         if (Address.QuadPart == 0)
             return XenKdFail(STATUS_INVALID_ADDRESS, L"xenkd: cannot get the physical address of the shared area");
 
-        Header->Gfn[Index] = (ULONG64)Address.QuadPart >> PAGE_SHIFT;
+        Header->RingGfn[Index] = (ULONG64)Address.QuadPart >> PAGE_SHIFT;
     }
 
     Header->Generation = Generation;
@@ -288,7 +282,7 @@ static NTSTATUS XenKdInitializeShm(_In_ PXENKD_ADAPTER Adapter) {
     Adapter->LastHeartbeatTime = Now;
 
     KeMemoryBarrier();
-    Header->Magic = XENKD_SHM_MAGIC;
+    Header->Signature = XENKD_SHM_SIGNATURE;
 
     return STATUS_SUCCESS;
 }
@@ -296,19 +290,18 @@ static NTSTATUS XenKdInitializeShm(_In_ PXENKD_ADAPTER Adapter) {
 NTSTATUS
 XenKdInitializeController(__in PKDNET_SHARED_DATA KdNet) {
     PXENKD_ADAPTER Adapter;
-    ULONGLONG Pfn;
-    PHYSICAL_ADDRESS Address;
     NTSTATUS Status;
     ULONG Index;
 
     Adapter = (PXENKD_ADAPTER)KdNet->Hardware;
     Adapter->KdNet = KdNet;
-    Adapter->Ring = NULL;
-    Adapter->NotifyPending = FALSE;
+    Adapter->IoPort = XenKdIoPort;
+    Adapter->Initialized = FALSE;
+    Adapter->RendezvousAccepted = FALSE;
     Adapter->Shm = ALIGN_UP_POINTER_BY(Adapter->ShmSpace, PAGE_SIZE);
 
     // dom0 may still be attached to a previous controller in this memory: stop it writing as soon as possible.
-    Adapter->Shm->Header.Magic = 0;
+    Adapter->Shm->Header.Signature = 0;
     KeMemoryBarrier();
 
     for (Index = 0; Index < XENKD_RX_BUFFERS; Index++) {
@@ -323,28 +316,10 @@ XenKdInitializeController(__in PKDNET_SHARED_DATA KdNet) {
         Adapter->KdNet->Device->DeviceID != PCI_DEVICE_ID_XENKD)
         return XenKdFail(STATUS_NO_SUCH_DEVICE, L"xenkd: not the xenkd PCI device");
 
-    Status = HypercallInitialize();
-    if (!NT_SUCCESS(Status))
-        return XenKdFail(Status, L"xenkd: Xen hypervisor not detected");
-
-    // The default console ring is set up by the toolstack and needs neither xenstore nor grant tables.
-    Status = HvmGetParameter(HVM_PARAM_CONSOLE_PFN, &Pfn);
-    if (!NT_SUCCESS(Status))
-        return XenKdFail(Status, L"xenkd: HVMOP_get_param(HVM_PARAM_CONSOLE_PFN) failed");
-    if (Pfn == 0)
-        return XenKdFail(STATUS_NO_SUCH_DEVICE, L"xenkd: no PV console (HVM_PARAM_CONSOLE_PFN is 0)");
-
-    Address.QuadPart = (LONGLONG)(Pfn << PAGE_SHIFT);
-    Adapter->Ring = KdMapPhysicalMemory64(Address, 1, TRUE);
-    if (Adapter->Ring == NULL)
-        return XenKdFail(STATUS_INSUFFICIENT_RESOURCES, L"xenkd: cannot map the console ring");
-
     Status = XenKdInitializeShm(Adapter);
-    if (!NT_SUCCESS(Status)) {
-        KdUnmapVirtualAddress(Adapter->Ring, 1, TRUE);
-        Adapter->Ring = NULL;
+    if (!NT_SUCCESS(Status))
         return Status;
-    }
+    Adapter->Initialized = TRUE;
 
     // The target MAC address is left alone: KDNET has already derived it from the SMBIOS UUID, which is also what the
     // dom0 bridge expects.
@@ -359,17 +334,17 @@ XenKdInitializeController(__in PKDNET_SHARED_DATA KdNet) {
 VOID XenKdShutdownController(__in PVOID Context) {
     PXENKD_ADAPTER Adapter = Context;
 
-    if (Adapter->Ring == NULL)
+    if (!Adapter->Initialized)
         return;
 
-    // Tell dom0 to let go of the shared area.
-    Adapter->Shm->Header.Magic = 0;
+    // The bridge unmaps before completing this OUT, so KDNET can reclaim the pages on return.
+    Adapter->Shm->Header.Signature = 0;
     Adapter->Shm->Header.Generation = 0;
     KeMemoryBarrier();
 
-    XenKdNotify(Adapter);
-    KdUnmapVirtualAddress(Adapter->Ring, 1, TRUE);
-    Adapter->Ring = NULL;
+    WRITE_PORT_ULONG((PULONG)(ULONG_PTR)Adapter->IoPort, XENKD_IO_DETACH);
+    Adapter->Initialized = FALSE;
+    Adapter->RendezvousAccepted = FALSE;
 }
 
 VOID XenKdSetHibernateRange(VOID) {
@@ -388,7 +363,7 @@ XenKdGetRxPacket(__in PVOID Context, __out PULONG Handle, __out PVOID *Packet, _
     PXENKD_ADAPTER Adapter = Context;
     ULONG Index;
 
-    if (Adapter->Ring == NULL)
+    if (!Adapter->Initialized)
         return STATUS_IO_TIMEOUT;
 
     // KDNET polls here even while the guest runs, which gives the housekeeping its chances. Never wait here.
@@ -446,7 +421,7 @@ XenKdSendTxPacket(__in PVOID Context, ULONG Handle, ULONG Length) {
     // can be reused.
     if (Length > XENKD_MAX_FRAME)
         Status = STATUS_INVALID_PARAMETER;
-    else if (Adapter->Ring == NULL)
+    else if (!Adapter->Initialized)
         Status = STATUS_UNSUCCESSFUL;
     else
         Status = XenKdSendFrame(Adapter, Adapter->Tx[Index].Data, Length);
@@ -505,7 +480,6 @@ KdInitializeLibrary(
     NTSTATUS Status;
     PKDNET_EXTENSIBILITY_EXPORTS Exports;
 
-    UNREFERENCED_PARAMETER(LoaderOptions);
     __security_init_cookie();
 
     KdNetExtensibilityImports = ImportTable;
@@ -519,6 +493,10 @@ KdInitializeLibrary(
         Status = STATUS_INVALID_PARAMETER;
         goto out;
     }
+
+    Status = XenKdConfigurePort(LoaderOptions);
+    if (!NT_SUCCESS(Status))
+        goto out;
 
     // Packet-based extensibility model: KDNET hands us whole Ethernet frames, which go through rings in memory shared
     // with dom0. KdReadSerialByte and KdWriteSerialByte must stay NULL (KDNET zeroes the table), or KDNET rejects the

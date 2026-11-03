@@ -2,7 +2,7 @@
 """Bridge a guest's xenkd to the debugger, over UDP from dom0.
 
 xenkd gives KDNET a network card made of two rings of Ethernet frames in guest memory (see xenkd/xenkd_shm.h), and
-announces where they are on the guest's PV console. The bridge maps the rings from dom0, polls them, and stands in for
+announces their header PFN with a 32-bit I/O write. The bridge maps the rings from dom0, polls them, and stands in for
 KDNET's network: it answers the guest's ARP, forwards its UDP payloads to the debugger from an ordinary UDP socket, and
 wraps the debugger's replies back into frames. The debugger only needs to reach dom0 on one UDP port: the guest's
 HOST_IP:port, or --debugger. DHCP isn't answered, so the guest needs NO_DHCP and TARGET_IP (as Enable-XenKd.ps1 sets
@@ -16,8 +16,9 @@ It follows the guest across reboots, which change its domid: by its UUID on XAPI
 can repeat, and by its name with xl, where `xl create` gives a new UUID unless the config sets one. A domid, or the
 other of the two, is looked up from the running domain at startup.
 
-Run in dom0 as root. Needs xenstore-read, xenstore-list and libxenforeignmemory. Don't run `xl console` on the same
-domain at the same time: it would read the same pty, and could swallow xenkd's announces.
+Run in dom0 as root. Needs xenstore-read, xenstore-list, libxenforeignmemory, libxendevicemodel and libxenevtchn.
+The I/O port defaults to 0xec; --io-port and the guest's XENKD_IOPORT load option must agree. Its four bytes must be
+reserved in guest ACPI and unused by other virtual hardware. The PV console is left alone.
 """
 
 import argparse
@@ -34,7 +35,6 @@ import struct
 import subprocess
 import sys
 import time
-import tty
 import uuid
 
 # The largest Ethernet frame (without FCS) that xenkd sends or accepts (XENKD_MAX_FRAME).
@@ -50,18 +50,22 @@ XAPI_INVENTORY = "/etc/xensource-inventory"
 ACTIVE_POLL_INTERVAL = 0.0002
 IDLE_POLL_INTERVAL = 0.005
 ACTIVE_PERIOD = 1.0
-# With --fast, how often to look up the domain, console and timeouts again while spinning.
+# With --fast, how often to check I/O notifications and timeouts again while spinning.
 SPIN_SLICE = 0.001
 
 # The shared area, as laid out in xenkd/xenkd_shm.h: a header page, then the TX ring (guest to dom0) and the RX ring
 # (dom0 to guest). Each slot is a 32-bit length followed by the frame. Indices are free-running 32-bit counters.
 PAGE_SIZE = 4096
-SHM_MAGIC = 0x53444B58  # "XKDS"
-SHM_VERSION = 1
-SHM_MAX_PAGES = 64
-SHM_MAGIC_OFFSET = 0x000
-SHM_GENERATION_OFFSET = 0x008
-SHM_GFN_OFFSET = 0x020
+SHM_VERSION = 2
+SHM_SIGNATURE = 0x00444B58 | (SHM_VERSION << 24)  # "XKD", then version
+SHM_SIGNATURE_OFFSET = 0x000
+SHM_GENERATION_OFFSET = 0x004
+SHM_GFN_OFFSET = 0x008
+SHM_SLOT_SIZE = 2048
+SHM_TX_SLOTS = 32
+SHM_RX_SLOTS = 16
+SHM_RING_PAGES = (SHM_TX_SLOTS + SHM_RX_SLOTS) * SHM_SLOT_SIZE // PAGE_SIZE
+SHM_RX_OFFSET = SHM_TX_SLOTS * SHM_SLOT_SIZE
 SHM_TX_PROD = 0x400
 SHM_TX_CONS = 0x440
 SHM_RX_PROD = 0x480
@@ -69,10 +73,18 @@ SHM_RX_CONS = 0x4C0
 SHM_DOM0_GENERATION = 0x500
 SHM_DOM0_HEARTBEAT = 0x504
 INDEX_MASK = 0xFFFFFFFF
-# What xenkd writes on the console while dom0 isn't attached to its rings.
-ANNOUNCE = re.compile(rb"xenkd-shm v1 gfn=([0-9a-f]+) gen=([0-9a-f]+)")
-# Longer console lines aren't announces, and only their end is kept.
-MAX_CONSOLE_LINE = 256
+# Rendezvous v1 (XENKD_DEFAULT_IO_PORT / XENKD_IO_DETACH). A port change is an explicit choice on both ends.
+DEFAULT_IO_PORT = 0xEC
+IO_DETACH = 0xFFFFFFFF
+# Xen public hvm/ioreq.h: one 32-byte request per vCPU, in one shared page.
+IOREQ = struct.Struct("<QQIIIHBB")
+IOREQ_STATE_OFFSET = 30
+IOREQ_READY = 1
+IOREQ_INPROCESS = 2
+IORESP_READY = 3
+IOREQ_READ = 0x20
+IOREQ_DATA_IS_PTR = 0x10
+IOREQ_TYPE_PIO = 0
 
 ETHERTYPE_IPV4 = b"\x08\x00"
 ETHERTYPE_ARP = b"\x08\x06"
@@ -173,18 +185,14 @@ def kdnet_mac(smbios_uuid):
     return bytes(mac)
 
 
-class Console:
-    """The PV console pty of the domain we follow, reopened whenever the domain is recreated (with a new domid and pty).
-
-    It's only read: xenkd announces its rings there.
-    """
+class Domain:
+    """Follow a guest's identity without acquiring its console."""
 
     def __init__(self, key, value):
         """Follow the domain whose UUID (key "vm") or name (key "name") is value."""
         self.key, self.value = key, value
-        self.fd = self.domid = self.path = self.status = None
+        self.domid = self.status = None
         self.next_check = 0.0
-        self.partial = b""
 
     def set_status(self, status):
         # Log state changes only, not every check.
@@ -192,73 +200,30 @@ class Console:
             self.status = status
             log(status)
 
-    def console_path(self, domid):
-        """The console pty of domain domid, if it's (still) the domain we follow."""
-        if read_domain(domid, self.key) != self.value:
-            return None
-        return query("xenstore-read", "/local/domain/%s/console/tty" % domid)
-
     def poll(self):
-        """Follow the domain: return True when its console was just (re)opened."""
+        """Return True when the domain changes, including disappearance."""
         now = time.monotonic()
         if now < self.next_check:
             return False
         self.next_check = now + DOMAIN_CHECK_INTERVAL
 
-        if self.fd is not None:
-            # Usually still the same domain: confirming that is cheaper than a search.
-            if self.console_path(self.domid) == self.path:
-                return False
-            self.close()
+        if self.domid is not None and read_domain(self.domid, self.key) == self.value:
+            return False
+        old = self.domid
         domids = find_domains(self.key, self.value)
         if not domids:
+            self.domid = None
             self.set_status("waiting for domain %s..." % self.value)
-            return False
-        path = self.console_path(domids[0])
-        if path is None:
-            self.set_status("waiting for the PV console of domain %s..." % domids[0])
-            return False
-
-        try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
-            # No line discipline or echo: echo would send the guest's output back to it.
-            tty.setraw(fd)
-        except OSError as e:
-            self.set_status("cannot open %s: %s" % (path, e))
-            return False
-        self.fd, self.domid, self.path = fd, domids[0], path
-        self.partial = b""
-        self.set_status("attached to %s (domain %s)" % (path, self.domid))
-        return True
+        else:
+            if len(domids) != 1:
+                raise SystemExit("multiple domains match %s: %s" % (self.value, domids))
+            self.domid = domids[0]
+            self.set_status("following domain %s" % self.domid)
+        return old != self.domid
 
     def time_to_poll(self):
         """How long until poll() has something to check."""
         return max(0.0, self.next_check - time.monotonic())
-
-    def close(self):
-        if self.fd is not None:
-            os.close(self.fd)
-            self.fd = None
-            self.set_status("detached from %s (domain %s)" % (self.path, self.domid))
-        # Look for the domain again soon: a rebooting guest is back within seconds.
-        self.next_check = min(self.next_check, time.monotonic() + 1.0)
-
-    def read_lines(self):
-        """Read what's available, and return the complete lines in it."""
-        try:
-            data = os.read(self.fd, 4096)
-        except BlockingIOError:
-            return []
-        except OSError as e:
-            if e.errno != errno.EIO:
-                raise
-            data = b""
-        if not data:
-            self.close()
-            return []
-        lines = (self.partial + data).split(b"\n")
-        self.partial = lines.pop()[-MAX_CONSOLE_LINE:]
-        return lines
 
 
 class ForeignMemory:
@@ -322,8 +287,244 @@ class ForeignMemory:
     def unmap(self, address, pages):
         self.lib.xenforeignmemory_unmap(self.handle, address, pages)
 
+    def map_ioreq(self, domid, server_id):
+        """Map Xen's ioreq resource, which is not an ordinary guest GFN when the server is enabled."""
+        fn = self.lib.xenforeignmemory_map_resource
+        fn.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint16,
+            ctypes.c_uint,
+            ctypes.c_uint,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        fn.restype = ctypes.c_void_p
+        address = ctypes.c_void_p()
+        # memory.h: resource_ioreq_server = 0, frame_ioreq(0) = 1 (frame 0 is the buffered ring).
+        resource = fn(
+            self.handle,
+            int(domid),
+            0,
+            server_id,
+            1,
+            1,
+            ctypes.byref(address),
+            self.PROT_READ_WRITE,
+            0,
+        )
+        if not resource:
+            raise xen_error("xenforeignmemory_map_resource")
+        area = self.memory_view(address.value, PAGE_SIZE, self.PyBUF_WRITE)
+        return resource, area
+
+    def unmap_ioreq(self, resource):
+        fn = self.lib.xenforeignmemory_unmap_resource
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        fn.restype = ctypes.c_int
+        xen_check(fn(self.handle, resource), "xenforeignmemory_unmap_resource")
+
     def close(self):
         self.lib.xenforeignmemory_close(self.handle)
+
+
+def xen_error(operation):
+    error = ctypes.get_errno()
+    return OSError(error, "%s: %s" % (operation, os.strerror(error)))
+
+
+def xen_check(result, operation):
+    if result < 0:
+        raise xen_error(operation)
+    return result
+
+
+def xen_library(name, signatures):
+    lib = ctypes.CDLL("lib%s.so.1" % name, use_errno=True)
+    for suffix, result, args in signatures:
+        fn = getattr(lib, name + "_" + suffix)
+        fn.restype, fn.argtypes = result, args
+    return lib
+
+
+class IoreqServer:
+    """A secondary emulator for one four-byte rendezvous register. It never acquires guest xenbus bindings."""
+
+    def __init__(self, domid, io_port, memory):
+        handle, uint, ushort = ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint16
+        integer, ulonglong = ctypes.c_int, ctypes.c_uint64
+        self.domid, self.io_port, self.memory = int(domid), io_port, memory
+        self.dm_handle = self.evt_handle = self.server_id = None
+        self.resource = self.area = self.fd = None
+        self.ports = {}
+        self.next_bind_check = 0.0
+        self.dm = xen_library(
+            "xendevicemodel",
+            [
+                ("open", handle, [handle, uint]),
+                ("close", integer, [handle]),
+                (
+                    "create_ioreq_server",
+                    integer,
+                    [handle, ushort, integer, ctypes.POINTER(ushort)],
+                ),
+                ("destroy_ioreq_server", integer, [handle, ushort, ushort]),
+                ("set_ioreq_server_state", integer, [handle, ushort, ushort, integer]),
+                (
+                    "map_io_range_to_ioreq_server",
+                    integer,
+                    [handle, ushort, ushort, integer, ulonglong, ulonglong],
+                ),
+            ],
+        )
+        self.evt = xen_library(
+            "xenevtchn",
+            [
+                ("open", handle, [handle, uint]),
+                ("close", integer, [handle]),
+                ("fd", integer, [handle]),
+                ("bind_interdomain", integer, [handle, uint, uint]),
+                ("pending", integer, [handle]),
+                ("notify", integer, [handle, uint]),
+                ("unmask", integer, [handle, uint]),
+            ],
+        )
+        try:
+            self.dm_handle = self.dm.xendevicemodel_open(None, 0)
+            if not self.dm_handle:
+                raise xen_error("xendevicemodel_open")
+            self.evt_handle = self.evt.xenevtchn_open(None, 0)
+            if not self.evt_handle:
+                raise xen_error("xenevtchn_open")
+            server_id = ushort()
+            xen_check(
+                self.dm.xendevicemodel_create_ioreq_server(
+                    self.dm_handle, self.domid, 0, ctypes.byref(server_id)
+                ),
+                "xendevicemodel_create_ioreq_server",
+            )
+            self.server_id = server_id.value
+            self.resource, self.area = memory.map_ioreq(self.domid, self.server_id)
+            # Xen fills vp_eport only when enabled. Map the range last, once all response paths are ready.
+            xen_check(
+                self.dm.xendevicemodel_set_ioreq_server_state(
+                    self.dm_handle, self.domid, self.server_id, 1
+                ),
+                "xendevicemodel_set_ioreq_server_state",
+            )
+            self.refresh_ports()
+            self.fd = xen_check(self.evt.xenevtchn_fd(self.evt_handle), "xenevtchn_fd")
+            xen_check(
+                self.dm.xendevicemodel_map_io_range_to_ioreq_server(
+                    self.dm_handle, self.domid, self.server_id, 0, io_port, io_port + 3
+                ),
+                "xendevicemodel_map_io_range_to_ioreq_server",
+            )
+        except BaseException:
+            self.close()
+            raise
+        log("listening on i/o port %#x (domain %s)" % (io_port, domid))
+
+    def refresh_ports(self):
+        """Bind Xen's per-vCPU endpoints, including vCPUs added after startup."""
+        if time.monotonic() < self.next_bind_check:
+            return
+        self.next_bind_check = time.monotonic() + 1.0
+        bound = set(self.ports.values())
+        for offset in range(0, PAGE_SIZE, IOREQ.size):
+            remote = struct.unpack_from("<I", self.area, offset + 24)[0]
+            if remote and offset not in bound:
+                local = xen_check(
+                    self.evt.xenevtchn_bind_interdomain(
+                        self.evt_handle, self.domid, remote
+                    ),
+                    "xenevtchn_bind_interdomain",
+                )
+                self.ports[local] = offset
+
+    def dispatch(self, offset, link):
+        """Complete even unsupported requests so a stray access cannot leave a vCPU blocked."""
+        flags = self.area[offset + IOREQ_STATE_OFFSET]
+        if flags & 0xF != IOREQ_READY:
+            return
+        self.area[offset + IOREQ_STATE_OFFSET] = (flags & 0xF0) | IOREQ_INPROCESS
+        addr, data, count, size, remote, pad, flags, kind = IOREQ.unpack_from(
+            self.area, offset
+        )
+        try:
+            scalar = (
+                kind == IOREQ_TYPE_PIO
+                and addr == self.io_port
+                and size == 4
+                and count == 1
+                and not flags & IOREQ_DATA_IS_PTR
+            )
+            if scalar:
+                if flags & IOREQ_READ:
+                    struct.pack_into(
+                        "<Q", self.area, offset + 8, link.accepted_pfn(str(self.domid))
+                    )
+                else:
+                    # Keep the issuing vCPU stopped until mapping/unmapping finishes, especially on shutdown.
+                    link.announce(str(self.domid), data & INDEX_MASK)
+            elif flags & IOREQ_READ and not flags & IOREQ_DATA_IS_PTR:
+                struct.pack_into("<Q", self.area, offset + 8, 0xFFFFFFFFFFFFFFFF)
+        finally:
+            # Aligned fields and x86 TSO: data is visible before the response state and notification.
+            self.area[offset + IOREQ_STATE_OFFSET] = (flags & 0xF0) | IORESP_READY
+
+    def service(self, link):
+        # xenevtchn_pending may block even with O_NONBLOCK on some kernels. Always select before calling it.
+        while select.select([self.fd], [], [], 0)[0]:
+            local = xen_check(
+                self.evt.xenevtchn_pending(self.evt_handle), "xenevtchn_pending"
+            )
+            offset = self.ports.get(local)
+            try:
+                if offset is not None:
+                    try:
+                        self.dispatch(offset, link)
+                    finally:
+                        xen_check(
+                            self.evt.xenevtchn_notify(self.evt_handle, local),
+                            "xenevtchn_notify",
+                        )
+            finally:
+                xen_check(
+                    self.evt.xenevtchn_unmask(self.evt_handle, local),
+                    "xenevtchn_unmask",
+                )
+
+    def close(self):
+        # Closing the dom0 handles alone does not destroy a server owned by dom0. Destroy it explicitly, which also
+        # removes its ranges and releases pending requests, before unmapping Xen's request page.
+        if self.server_id is not None:
+            result = self.dm.xendevicemodel_destroy_ioreq_server(
+                self.dm_handle, self.domid, self.server_id
+            )
+            if result < 0 and ctypes.get_errno() not in (errno.ESRCH, errno.ENOENT):
+                log(
+                    "cannot destroy ioreq server: %s"
+                    % xen_error("destroy_ioreq_server")
+                )
+            self.server_id = None
+        if self.area is not None:
+            self.area.release()
+            self.area = None
+        try:
+            if self.resource is not None:
+                self.memory.unmap_ioreq(self.resource)
+                self.resource = None
+        finally:
+            if self.evt_handle:
+                self.evt.xenevtchn_close(self.evt_handle)
+                self.evt_handle = None
+            if self.dm_handle:
+                self.dm.xendevicemodel_close(self.dm_handle)
+                self.dm_handle = None
+            self.fd = None
 
 
 class RingError(Exception):
@@ -331,28 +532,23 @@ class RingError(Exception):
 
 
 class SharedRings:
-    """dom0's end of xenkd's rings (see xenkd/xenkd_shm.h), in a writable buffer holding the whole area. Any buffer
-    works, so this can be tested without a guest.
+    """dom0's end of xenkd's rings (see xenkd/xenkd_shm.h), with separate header and ring buffers. Any buffers work,
+    so this can be tested without a guest.
 
     x86 is TSO, so aligned 32-bit loads and stores done in program order are all the ordering needed. dom0's own
-    indices are kept here, and only written to the area: the guest can't confuse us by changing them.
+    indices are kept here, and only written to the header: the guest can't confuse us by changing them.
     """
 
-    def __init__(self, area, generation):
+    def __init__(self, header, area, generation):
         """Attach: the header must still be the one announced with this generation."""
+        self.check_header(header, generation)
+        if len(area) != SHM_RING_PAGES * PAGE_SIZE:
+            raise RingError("expected %d ring pages" % SHM_RING_PAGES)
+        self.header = memoryview(header)
+        self.words = words = self.header.cast("I")
         self.area = memoryview(area)
-        self.words = words = self.area.cast("I")
-        page_count, self.slot_size, self.tx_slots, self.rx_slots = self.check_header(
-            self.area, generation
-        )
-        if len(self.area) < page_count * PAGE_SIZE:
-            raise RingError(
-                "%d pages mapped, the guest says %d"
-                % (len(self.area) // PAGE_SIZE, page_count)
-            )
+        self.data_words = self.area.cast("I")
         self.generation = generation
-        self.tx_offset = PAGE_SIZE
-        self.rx_offset = PAGE_SIZE + self.tx_slots * self.slot_size
 
         # Drop anything stale, and rewrite all of our fields before claiming the area, so that a stale write from an
         # earlier attachment is harmless.
@@ -364,46 +560,26 @@ class SharedRings:
 
     @staticmethod
     def check_header(header, generation):
-        """Check the header of a shared area, and return its geometry: (page count, slot size, TX slots, RX slots)."""
-        magic, version, actual_generation, page_count, slot_size, tx_slots, rx_slots = (
-            struct.unpack_from("<7I", header, 0)
-        )
-        if magic != SHM_MAGIC:
-            raise RingError("no shared area there (magic %08x)" % magic)
-        if version != SHM_VERSION:
-            raise RingError("unsupported shared area version %d" % version)
-        if actual_generation != generation:
+        """The versioned signature fixes all geometry; generation identifies this initialization."""
+        if len(header) != PAGE_SIZE:
+            raise RingError("expected one header page")
+        signature, actual_generation = struct.unpack_from("<II", header, 0)
+        if signature != SHM_SIGNATURE:
+            raise RingError("unsupported shared area signature %08x" % signature)
+        if generation == 0 or actual_generation != generation:
             raise RingError(
                 "generation %x, not %x as announced" % (actual_generation, generation)
             )
-        if (
-            slot_size < 4 + MAX_FRAME
-            or slot_size > PAGE_SIZE
-            or slot_size & (slot_size - 1)
-        ):
-            raise RingError("bad slot size %d" % slot_size)
-        for slots in (tx_slots, rx_slots):
-            if slots == 0 or slots & (slots - 1):
-                raise RingError("bad slot count %d" % slots)
-        if (
-            page_count > SHM_MAX_PAGES
-            or page_count * PAGE_SIZE < PAGE_SIZE + (tx_slots + rx_slots) * slot_size
-        ):
-            raise RingError(
-                "bad page count %d for %d+%d slots of %d bytes"
-                % (page_count, tx_slots, rx_slots, slot_size)
-            )
-        return page_count, slot_size, tx_slots, rx_slots
 
     def check(self):
         """Make sure the guest still uses the area as announced: called before every batch of writes, to keep the
         window in which we could write into pages Windows has reused as small as possible."""
-        magic = self.words[SHM_MAGIC_OFFSET // 4]
+        signature = self.words[SHM_SIGNATURE_OFFSET // 4]
         generation = self.words[SHM_GENERATION_OFFSET // 4]
-        if magic != SHM_MAGIC or generation != self.generation:
+        if signature != SHM_SIGNATURE or generation != self.generation:
             raise RingError(
-                "the guest let go of it (magic %08x, generation %x)"
-                % (magic, generation)
+                "the guest let go of it (signature %08x, generation %x)"
+                % (signature, generation)
             )
 
     def receive(self):
@@ -415,12 +591,12 @@ class SharedRings:
         prod = words[SHM_TX_PROD // 4]
         if prod == self.tx_cons:
             return []
-        if (prod - self.tx_cons) & INDEX_MASK > self.tx_slots:
+        if (prod - self.tx_cons) & INDEX_MASK > SHM_TX_SLOTS:
             raise RingError("bad TX producer %d (consumer %d)" % (prod, self.tx_cons))
         frames = []
         while self.tx_cons != prod:
-            offset = self.tx_offset + (self.tx_cons % self.tx_slots) * self.slot_size
-            length = words[offset // 4]
+            offset = (self.tx_cons % SHM_TX_SLOTS) * SHM_SLOT_SIZE
+            length = self.data_words[offset // 4]
             if length > MAX_FRAME:
                 raise RingError("the guest sent a frame of %d bytes" % length)
             # Empty slots are skipped, but consumed.
@@ -438,13 +614,13 @@ class SharedRings:
         words = self.words
         cons = words[SHM_RX_CONS // 4]
         pending = (self.rx_prod - cons) & INDEX_MASK
-        if pending > self.rx_slots:
+        if pending > SHM_RX_SLOTS:
             raise RingError("bad RX consumer %d (producer %d)" % (cons, self.rx_prod))
-        if pending == self.rx_slots:
+        if pending == SHM_RX_SLOTS:
             return False
-        offset = self.rx_offset + (self.rx_prod % self.rx_slots) * self.slot_size
+        offset = SHM_RX_OFFSET + (self.rx_prod % SHM_RX_SLOTS) * SHM_SLOT_SIZE
         self.area[offset + 4 : offset + 4 + len(frame)] = frame
-        words[offset // 4] = len(frame)
+        self.data_words[offset // 4] = len(frame)
         self.rx_prod = (self.rx_prod + 1) & INDEX_MASK
         words[SHM_RX_PROD // 4] = self.rx_prod
         return True
@@ -457,6 +633,8 @@ class SharedRings:
         except RingError:
             pass
         self.words.release()
+        self.header.release()
+        self.data_words.release()
         self.area.release()
 
 
@@ -472,7 +650,7 @@ class DropCounter:
 
 
 class GuestLink:
-    """The guest's rings: attached when xenkd announces them on the console, detached when they go away."""
+    """The guest's rings: attached by a PFN write, detached by all ones or when the area goes away."""
 
     def __init__(self, args, memory=None):
         self.args = args
@@ -480,7 +658,7 @@ class GuestLink:
             self.memory = memory or ForeignMemory()
         except OSError as e:
             raise SystemExit("cannot map guest memory: %s" % e)
-        self.domid = self.rings = self.mapping = self.error = None
+        self.domid = self.gfn = self.rings = self.mapping = self.error = None
         self.last_traffic = 0.0
         self.full = DropCounter("guest RX ring full")
         self.too_large = DropCounter("frame too large for the guest")
@@ -489,71 +667,86 @@ class GuestLink:
     def attached(self):
         return self.rings is not None
 
-    def console(self, console, lines):
-        """Handle lines from the guest's console, which may hold announces."""
-        for line in lines:
-            match = ANNOUNCE.search(line)
-            if match:
-                gfn, generation = int(match.group(1), 16), int(match.group(2), 16)
-                self.announce(console.domid, gfn, generation)
-            elif self.args.verbose and line.strip():
-                log("console: %s" % line.decode(errors="replace").rstrip())
+    def accepted_pfn(self, domid):
+        """Readback acknowledges an attached, still-valid header, not merely receipt of a port write."""
+        if self.attached and self.domid == domid:
+            try:
+                self.rings.check()
+                return self.gfn
+            except RingError as e:
+                self.detach(str(e))
+        return IO_DETACH
 
-    def announce(self, domid, gfn, generation):
-        if self.attached:
-            # xenkd announced before it saw us: no need to reset the rings.
-            if (self.domid, self.rings.generation) == (domid, generation):
+    def announce(self, domid, gfn):
+        if gfn == IO_DETACH:
+            self.detach("the guest closed the rings")
+            self.error = None
+            return
+        if self.attached and (self.domid, self.gfn) == (domid, gfn):
+            try:
+                self.rings.check()
                 return
-            self.detach("the guest announced generation %x" % generation)
+            except RingError as e:
+                self.detach(str(e))
+
+        mappings = []
         try:
-            # The header lists the area's pages: map it alone first.
+            # Retain the header mapping; the PFN array contains only packet-ring pages.
             address, header = self.memory.map(domid, [gfn])
-            try:
-                page_count = SharedRings.check_header(header, generation)[0]
-                gfns = list(
-                    struct.unpack_from("<%dQ" % page_count, header, SHM_GFN_OFFSET)
-                )
-            finally:
-                header.release()
-                self.memory.unmap(address, 1)
-            if gfns[0] != gfn:
-                raise RingError("the header says it's at gfn %x" % gfns[0])
+            mappings.append((address, header, 1))
+            generation = struct.unpack_from("<I", header, SHM_GENERATION_OFFSET)[0]
+            SharedRings.check_header(header, generation)
+            gfns = list(
+                struct.unpack_from("<%dQ" % SHM_RING_PAGES, header, SHM_GFN_OFFSET)
+            )
+            if gfn in gfns or len(set(gfns)) != SHM_RING_PAGES:
+                raise RingError("ring PFNs overlap each other or the header")
+            if self.attached:
+                self.detach("the guest announced generation %x" % generation)
             address, area = self.memory.map(domid, gfns)
-            try:
-                rings = SharedRings(area, generation)
-            except Exception:
-                area.release()
-                self.memory.unmap(address, page_count)
+            mappings.append((address, area, SHM_RING_PAGES))
+            # Both mappings are now live. Validate the retained header again before publishing attachment.
+            SharedRings.check_header(header, generation)
+            current_gfns = list(
+                struct.unpack_from("<%dQ" % SHM_RING_PAGES, header, SHM_GFN_OFFSET)
+            )
+            if current_gfns != gfns:
+                raise RingError("the page list changed while mapping the shared area")
+            rings = SharedRings(header, area, generation)
+        except BaseException as e:
+            for address, view, pages in reversed(mappings):
+                view.release()
+                self.memory.unmap(address, pages)
+            if not isinstance(e, (OSError, RingError)):
                 raise
-        except (OSError, RingError) as e:
             # The guest announces every second until we attach, so say it once.
             error = "cannot attach to the shared area at gfn %x: %s" % (gfn, e)
             if error != self.error:
                 self.error = error
                 log(error)
             return
-        self.domid, self.rings, self.error = domid, rings, None
-        self.mapping = address, area, page_count
+        self.domid, self.gfn, self.rings, self.error = domid, gfn, rings, None
+        self.mapping = mappings
         self.last_traffic = time.monotonic()
         log(
-            "attached to the shared area at gfn %x (generation %x, %d pages,"
+            "attached to the shared area at gfn %x (generation %x, %d ring pages,"
             " %d TX and %d RX slots)"
-            % (gfn, generation, page_count, rings.tx_slots, rings.rx_slots)
+            % (gfn, generation, SHM_RING_PAGES, SHM_TX_SLOTS, SHM_RX_SLOTS)
         )
 
     def detach(self, reason):
         if not self.attached:
             return
         self.rings.detach()
-        address, area, page_count = self.mapping
-        area.release()
-        self.memory.unmap(address, page_count)
+        for address, view, pages in reversed(self.mapping):
+            view.release()
+            self.memory.unmap(address, pages)
         self.rings = self.mapping = None
         log("detached from the shared area: %s" % reason)
 
-    def follow(self, console):
+    def follow(self, domain):
         """Detach when the domain we're attached to goes away."""
-        if self.attached and (console.fd is None or console.domid != self.domid):
+        if self.attached and domain.domid != self.domid:
             self.detach("domain %s went away" % self.domid)
 
     def busy(self):
@@ -601,6 +794,18 @@ class GuestLink:
     def close(self):
         self.detach("the bridge is exiting")
         self.memory.close()
+
+
+def parse_io_port(text):
+    try:
+        port = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected an I/O port, such as 0xec")
+    if port <= 0 or port > 0xFFFC or port & 3:
+        raise argparse.ArgumentTypeError(
+            "I/O port must be nonzero and four-byte aligned, at most 0xfffc"
+        )
+    return port
 
 
 def parse_address(text):
@@ -859,9 +1064,10 @@ class UdpProxy:
 
 def run(args):
     key = follow_key()
-    console = Console(key, resolve_domain(args.domain, key))
-    proxy = UdpProxy(args)
+    domain = Domain(key, resolve_domain(args.domain, key))
     link = GuestLink(args)
+    server = proxy = None
+    error = None
 
     def send_to_guest(frame):
         if args.verbose:
@@ -869,48 +1075,83 @@ def run(args):
         link.send(frame)
 
     try:
+        proxy = UdpProxy(args)
         while True:
-            # The domain check runs commands, which stall polling for milliseconds: put it off while frames flow. A
-            # domain going away meanwhile still shows, as its console pty closes.
-            if not link.busy() and console.poll():
-                # KDNET's MAC follows from the domain's UUID (which xl changes when it recreates a domain without a
-                # fixed one), so a restarted bridge can reach the guest right away.
-                smbios_uuid = read_domain(console.domid, "vm")
+            # Domain lookups run commands, so defer them while packet traffic is active.
+            changed = domain.poll() if not link.busy() else False
+            link.follow(domain)
+            if server is not None and str(server.domid) != domain.domid:
+                server.close()
+                server = None
+            if changed and domain.domid is not None:
+                smbios_uuid = read_domain(domain.domid, "vm")
                 if smbios_uuid and UUID_FORMAT.match(smbios_uuid):
                     proxy.guest_mac = kdnet_mac(smbios_uuid)
                     log(
                         "guest MAC is %s (from domain UUID %s)"
                         % (format_mac(proxy.guest_mac), smbios_uuid)
                     )
-            link.follow(console)
-
-            readers = [fd for fd in (proxy.socket, console.fd) if fd is not None]
-            timeout = link.timeout(console.time_to_poll())
-            # With --fast, the bookkeeping above costs about as much as a poll: only redo it every SPIN_SLICE, or once
-            # the console was read, which may close it, or attach to or detach from the rings.
+            if server is None and domain.domid is not None:
+                try:
+                    server = IoreqServer(domain.domid, args.io_port, link.memory)
+                    error = None
+                except OSError as e:
+                    # A domain can disappear between the identity check and server creation.
+                    if e.errno not in (errno.ESRCH, errno.ENOENT):
+                        raise
+                    message = "waiting for domain %s: %s" % (domain.domid, e)
+                    if error != message:
+                        log(message)
+                        error = message
+                    domain.domid = None
+            if server is not None:
+                server.refresh_ports()
+            readers = [
+                fd
+                for fd in (proxy.socket, server.fd if server else None)
+                if fd is not None
+            ]
+            timeout = link.timeout(domain.time_to_poll())
             spin_until = time.monotonic() + SPIN_SLICE if timeout == 0 else 0.0
             while True:
                 readable = select.select(readers, [], [], timeout)[0]
-                console_read = console.fd in readable
-                if console_read:
-                    link.console(console, console.read_lines())
-
+                config_read = server is not None and server.fd in readable
+                if config_read:
+                    try:
+                        server.service(link)
+                    except OSError:
+                        if read_domain(domain.domid, key) == domain.value:
+                            raise
+                        # The target vanished while a response was being sent. Recreate the server for its next domid.
+                        link.detach("domain %s went away" % domain.domid)
+                        server.close()
+                        server = None
+                        domain.domid = None
+                        domain.next_check = 0.0
+                        break
                 for frame in link.poll():
                     if args.verbose:
                         log("guest > proxy: %s" % describe_frame(frame))
                     for reply in proxy.from_guest(frame):
                         send_to_guest(reply)
-
                 if proxy.socket in readable:
                     frame = proxy.from_debugger()
-                    # Keep draining the socket while the guest is away, just don't pass anything on.
                     if frame is not None and link.attached:
                         send_to_guest(frame)
-
-                if console_read or time.monotonic() >= spin_until:
+                if config_read or time.monotonic() >= spin_until:
                     break
     finally:
-        link.close()
+        # Release the shared rings before destroying the server lets a blocked shutdown OUT return.
+        try:
+            link.detach("the bridge is exiting")
+        finally:
+            try:
+                if server is not None:
+                    server.close()
+            finally:
+                link.memory.close()
+                if proxy is not None and proxy.socket is not None:
+                    proxy.socket.close()
 
 
 def main():
@@ -955,6 +1196,14 @@ def main():
         " the debugger keeps seeing the target at the same address",
     )
     parser.add_argument(
+        "--io-port",
+        type=parse_io_port,
+        default=DEFAULT_IO_PORT,
+        metavar="PORT",
+        help="rendezvous I/O port (default: 0xec); must match the guest's XENKD_IOPORT"
+        " load option and have four reserved, unused bytes",
+    )
+    parser.add_argument(
         "--fast",
         action="store_true",
         help="while frames flow, poll the guest's rings continuously instead of every"
@@ -965,8 +1214,7 @@ def main():
         "-v",
         "--verbose",
         action="store_true",
-        help="log every frame passed in either direction, and the guest's other"
-        " console output",
+        help="log every frame passed in either direction",
     )
     args = parser.parse_args()
 
@@ -976,6 +1224,8 @@ def main():
         run(args)
     except KeyboardInterrupt:
         pass
+    except (OSError, AttributeError) as e:
+        raise SystemExit("cannot run the bridge: %s" % e)
 
 
 if __name__ == "__main__":

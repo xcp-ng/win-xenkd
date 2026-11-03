@@ -27,21 +27,14 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="hypercall.c" />
     <ClCompile Include="xenkd.c" />
   </ItemGroup>
   <ItemGroup>
     <None Include="xenkd.def" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="hypercall.h" />
     <ClInclude Include="xenkd.h" />
     <ClInclude Include="xenkd_shm.h" />
-  </ItemGroup>
-  <ItemGroup>
-    <MASM Include="amd64\hypercall_thunk.asm">
-      <ExcludedFromBuild Condition="'$(Platform)'!='x64'">true</ExcludedFromBuild>
-    </MASM>
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <ProjectGuid>{D45FBBA0-A611-CDA8-F759-1C5387303962}</ProjectGuid>
