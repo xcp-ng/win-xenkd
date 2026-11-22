@@ -190,11 +190,10 @@ before enabling the new DLL if you want to restore the PV console. It cannot rec
 ## Limitations
 
 - x64 guests only.
-- dom0 polls. It spins only while the guest is expected to send: for up to 200 µs after passing it a frame, and 50 µs
-  after each frame from it. Otherwise it waits for the debugger on its socket, and polls the guest every 200 µs while
-  frames flow, every 5 ms when idle. The bridge's `--fast` spins all the time while frames flow instead, which saves
-  waking up for each of the debugger's packets: dumps 15% (PyPy) to 35% (CPython) faster (see the table at the top),
-  but it keeps a dom0 CPU busy until 1 s after the last frame.
+- dom0 polls. It spins only while the guest is expected to send: briefly after passing it a frame, and after each frame
+  from it. Otherwise it waits for the debugger on its socket, and polls the guest every few milliseconds. The bridge's
+  `--fast` spins all the time while frames flow instead, which saves waking up for each of the debugger's packets:
+  faster dumps (see the table at the top), but it keeps a dom0 CPU busy for a moment after the last frame.
 - dom0 writes into guest memory that KDNET reserved. If Windows ever reused those pages while the bridge is attached,
   the bridge would corrupt them. The generation check makes that window small, which is acceptable for a debugging
   tool.

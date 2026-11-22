@@ -13,6 +13,7 @@ and libxenevtchn.
 """
 
 import argparse
+import contextlib
 import errno
 import hashlib
 import hmac
@@ -38,20 +39,15 @@ DOMAIN_CHECK_INTERVAL = 2.0
 UUID_FORMAT = re.compile(r"^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$", re.IGNORECASE)
 # Only XAPI hosts (XenServer, XCP-ng) have it.
 XAPI_INVENTORY = "/etc/xensource-inventory"
-# While attached, how often to poll the rings: every ACTIVE_POLL_INTERVAL for ACTIVE_PERIOD after the last frame in
-# either direction, then every IDLE_POLL_INTERVAL.
-ACTIVE_POLL_INTERVAL = 0.0002
-IDLE_POLL_INTERVAL = 0.005
-ACTIVE_PERIOD = 1.0
-# While the guest is expected to send, poll continuously instead: for up to GUEST_REPLY_SPIN after passing it a frame,
-# and GUEST_BURST_SPIN after each frame from it. KDNET answers a request within tens of microseconds, with a burst of
-# frames about 10 us apart; the debugger takes over 100 us to answer, during which the bridge waits on its socket.
-# With --fast, it keeps polling continuously while frames flow, which saves waking up for each of the debugger's
-# answers.
-GUEST_REPLY_SPIN = 0.0002
-GUEST_BURST_SPIN = 0.00005
-# While spinning, how often to check I/O notifications and timeouts again.
-SPIN_SLICE = 0.001
+# While attached, poll the rings every POLL_INTERVAL, or continuously while the guest is expected to send: for
+# REPLY_SPIN after passing it a frame, and BURST_SPIN after each frame from it. KDNET answers a request within tens of
+# microseconds, with a burst of frames about 10 us apart; the debugger takes over 100 us to answer, during which the
+# bridge waits on its socket. --fast spins for FAST_SPIN after either, which saves waking up for each of the
+# debugger's answers.
+POLL_INTERVAL = 0.005
+REPLY_SPIN = 0.0002
+BURST_SPIN = 0.00005
+FAST_SPIN = 0.05
 
 # Xen uses 4 KiB pages; shared-memory geometry and signature come from the CFFI declarations below.
 PAGE_SIZE = 4096
@@ -209,6 +205,11 @@ class Domain:
             self.domid = domids[0]
             self.set_status("following domain %s" % self.domid)
         return old != self.domid
+
+    def lose(self):
+        """Forget the domain after an error showing it's gone, and look for it again right away."""
+        self.domid = None
+        self.next_check = 0.0
 
     def time_to_poll(self):
         """How long until poll() has something to check."""
@@ -791,17 +792,12 @@ class DropCounter:
 class GuestLink:
     """The guest's rings: attached by a PFN write, detached by all ones or when the area goes away."""
 
-    def __init__(self, memory=None, fast=False):
-        self.fast = fast
-        if memory is None:
-            try:
-                memory = ForeignMemory()
-            except OSError as e:
-                raise SystemExit("cannot map guest memory: %s" % e)
+    def __init__(self, memory, fast=False):
+        self.reply_spin = FAST_SPIN if fast else REPLY_SPIN
+        self.burst_spin = FAST_SPIN if fast else BURST_SPIN
         self.memory = memory
         self.domid = self.gfn = self.rings = self.mapping = self.error = None
-        self.last_traffic = 0.0
-        # Until when the guest is expected to send.
+        # Until when to poll continuously: the guest is expected to send.
         self.spin_until = 0.0
         self.full = DropCounter("guest RX ring full")
         self.too_large = DropCounter("frame too large for the guest")
@@ -871,7 +867,6 @@ class GuestLink:
             raise
         self.domid, self.gfn, self.rings, self.error = domid, gfn, rings, None
         self.mapping = mappings
-        self.last_traffic = time.monotonic()
         log(
             "attached to the shared area at gfn %x (generation %x, %d ring pages,"
             " %d TX and %d RX slots)"
@@ -902,25 +897,13 @@ class GuestLink:
         if self.attached and domain.domid != self.domid:
             self.detach("domain %s went away" % self.domid)
 
-    def busy(self):
-        """Whether frames flowed in either direction within ACTIVE_PERIOD."""
-        return self.attached and time.monotonic() - self.last_traffic < ACTIVE_PERIOD
-
-    def spinning(self):
-        """Whether to poll continuously: the guest is expected to send soon, so waiting for the next poll would delay
-        a round trip, or frames flow with --fast."""
-        if not self.attached:
-            return False
-        return time.monotonic() < self.spin_until or (self.fast and self.busy())
-
     def timeout(self, limit):
-        """How long select() may wait before the rings need polling: at most limit, unless busy (when the domain check
-        that limit is for waits)."""
-        if self.spinning():
+        """How long select() may wait before the rings need polling: at most limit."""
+        if not self.attached:
+            return limit
+        if time.monotonic() < self.spin_until:
             return 0.0
-        if self.busy():
-            return ACTIVE_POLL_INTERVAL
-        return min(limit, IDLE_POLL_INTERVAL) if self.attached else limit
+        return min(limit, POLL_INTERVAL)
 
     def poll(self):
         """Heartbeat, and return the frames from the guest."""
@@ -933,8 +916,7 @@ class GuestLink:
             return []
         if frames:
             # The guest answered: what's left to wait for is the rest of its burst.
-            self.last_traffic = time.monotonic()
-            self.spin_until = self.last_traffic + GUEST_BURST_SPIN
+            self.spin_until = time.monotonic() + self.burst_spin
         return frames
 
     def send(self, frame):
@@ -950,14 +932,9 @@ class GuestLink:
             self.detach(str(e))
             return
         if sent:
-            self.last_traffic = time.monotonic()
-            self.spin_until = max(self.spin_until, self.last_traffic + GUEST_REPLY_SPIN)
+            self.spin_until = max(self.spin_until, time.monotonic() + self.reply_spin)
         else:
             self.full.drop()
-
-    def close(self):
-        self.detach("the bridge is exiting")
-        self.memory.close()
 
 
 def parse_io_port(text):
@@ -1220,101 +1197,110 @@ class UdpProxy:
         )
 
 
-def run(args, stopping):
-    key = follow_key()
-    domain = Domain(key, resolve_domain(args.domain, key))
-    link = GuestLink(fast=args.fast)
-    server = proxy = None
-    error = None
+class Bridge:
+    """The domain followed, its rendezvous and rings, and the debugger's socket, tied together."""
 
-    def send_to_guest(frame):
-        if not link.attached:
-            return
-        if args.verbose:
-            log("proxy > guest: %s" % describe_frame(frame))
-        link.send(frame)
-
-    try:
-        proxy = UdpProxy(args)
-        proxy.open_socket()
-        while not stopping():
-            # Domain lookups run commands, so defer them while packet traffic is active.
-            changed = False
-            if not link.busy():
-                changed = domain.poll()
-            link.follow(domain)
-            if server is not None and server.domid != domain.domid:
-                server.close()
-                server = None
-            if changed and domain.domid is not None:
-                smbios_uuid = read_domain(domain.domid, "vm")
-                if smbios_uuid and UUID_FORMAT.match(smbios_uuid):
-                    proxy.guest_mac = kdnet_mac(smbios_uuid)
-                    log(
-                        "guest MAC is %s (from domain UUID %s)"
-                        % (format_mac(proxy.guest_mac), smbios_uuid)
-                    )
-            if server is None and domain.domid is not None:
-                try:
-                    server = IoreqServer(domain.domid, args.io_port, link.memory)
-                    error = None
-                except OSError as e:
-                    # A domain can disappear between the identity check and server creation.
-                    if e.errno not in (errno.ESRCH, errno.ENOENT):
-                        raise
-                    message = "waiting for domain %s: %s" % (domain.domid, e)
-                    if error != message:
-                        log(message)
-                        error = message
-                    domain.domid = None
-            if server is not None:
-                server.refresh_ports()
-            readers = [proxy.socket]
-            if server is not None:
-                readers.append(server.fd)
-            # Wait for the debugger, an I/O request or the next poll. While the guest is expected to send, spin in this
-            # loop instead, coming back for the housekeeping above at least every SPIN_SLICE.
-            timeout = link.timeout(domain.time_to_poll())
-            slice_end = time.monotonic() + SPIN_SLICE
-            while not stopping():
-                readable = select.select(readers, [], [], timeout)[0]
-                config_read = server is not None and server.fd in readable
-                if config_read:
-                    try:
-                        server.service(link)
-                    except OSError:
-                        if read_domain(domain.domid, key) == domain.value:
-                            raise
-                        # The target vanished while a response was being sent. Recreate the server for its next domid.
-                        link.detach("domain %s went away" % domain.domid)
-                        server.close()
-                        server = None
-                        domain.domid = None
-                        domain.next_check = 0.0
-                        break
-                for frame in link.poll():
-                    if args.verbose:
-                        log("guest > proxy: %s" % describe_frame(frame))
-                    for reply in proxy.from_guest(frame):
-                        send_to_guest(reply)
-                if proxy.socket in readable:
-                    for frame in proxy.from_debugger():
-                        send_to_guest(frame)
-                if config_read or not link.spinning() or time.monotonic() >= slice_end:
-                    break
-                timeout = 0.0
-    finally:
-        # Release the shared rings before close() completes any outstanding shutdown OUT.
+    def __init__(self, args):
+        self.args = args
+        self.key = follow_key()
+        self.domain = Domain(self.key, resolve_domain(args.domain, self.key))
+        self.proxy = UdpProxy(args)
+        # Last: from here on, close() must run. Shared by the rings and the ioreq server, so closed after both.
         try:
-            link.detach("the bridge is exiting")
-        finally:
+            self.memory = ForeignMemory()
+        except OSError as e:
+            raise SystemExit("cannot map guest memory: %s" % e)
+        self.link = GuestLink(self.memory, fast=args.fast)
+        self.server = self.error = None
+
+    def follow_domain(self):
+        """Catch up with the domain: detach from a domain that went away, and serve the rendezvous of the current one.
+        Returns right away until a check is due, so it doesn't slow spinning down."""
+        changed = self.domain.poll()
+        self.link.follow(self.domain)
+        if self.server is not None and self.server.domid != self.domain.domid:
+            self.server.close()
+            self.server = None
+        if changed and self.domain.domid is not None:
+            smbios_uuid = read_domain(self.domain.domid, "vm")
+            if smbios_uuid and UUID_FORMAT.match(smbios_uuid):
+                self.proxy.guest_mac = kdnet_mac(smbios_uuid)
+                log(
+                    "guest MAC is %s (from domain UUID %s)"
+                    % (format_mac(self.proxy.guest_mac), smbios_uuid)
+                )
+        if self.server is None and self.domain.domid is not None:
             try:
-                if server is not None:
-                    server.close()
-            finally:
-                link.memory.close()
-                if proxy is not None and proxy.socket is not None:
-                    proxy.socket.close()
+                self.server = IoreqServer(
+                    self.domain.domid, self.args.io_port, self.memory
+                )
+                self.error = None
+            except OSError as e:
+                # A domain can disappear between the identity check and server creation.
+                if e.errno not in (errno.ESRCH, errno.ENOENT):
+                    raise
+                message = "waiting for domain %s: %s" % (self.domain.domid, e)
+                if self.error != message:
+                    log(message)
+                    self.error = message
+                self.domain.domid = None
+        if self.server is not None:
+            self.server.refresh_ports()
+
+    def serve(self):
+        """Wait for the debugger, an I/O request or the next poll (no wait while spinning), and pass frames along."""
+        readers = [self.proxy.socket]
+        if self.server is not None:
+            readers.append(self.server.fd)
+        timeout = self.link.timeout(self.domain.time_to_poll())
+        readable = select.select(readers, [], [], timeout)[0]
+        if self.server is not None and self.server.fd in readable:
+            try:
+                self.server.service(self.link)
+            except OSError:
+                if read_domain(self.domain.domid, self.key) == self.domain.value:
+                    raise
+                # The target vanished while a response was being sent. follow_domain() detaches, closes the server and
+                # creates one for the domain's next domid.
+                self.domain.lose()
+                return
+        for frame in self.link.poll():
+            if self.args.verbose:
+                log("guest > proxy: %s" % describe_frame(frame))
+            for reply in self.proxy.from_guest(frame):
+                self.send_to_guest(reply)
+        if self.proxy.socket in readable:
+            for frame in self.proxy.from_debugger():
+                self.send_to_guest(frame)
+
+    def send_to_guest(self, frame):
+        if not self.link.attached:
+            return
+        if self.args.verbose:
+            log("proxy > guest: %s" % describe_frame(frame))
+        self.link.send(frame)
+
+    def close(self):
+        # Every step runs even if an earlier one fails, last registered first: release the shared rings, then the ioreq
+        # server (whose close() completes any outstanding shutdown OUT), then the memory both used, then the socket.
+        with contextlib.ExitStack() as stack:
+            if self.proxy.socket is not None:
+                stack.callback(self.proxy.socket.close)
+            stack.callback(self.memory.close)
+            if self.server is not None:
+                stack.callback(self.server.close)
+            stack.callback(self.link.detach, "the bridge is exiting")
+
+
+def run(args, stopping):
+    bridge = Bridge(args)
+    try:
+        bridge.proxy.open_socket()
+        while not stopping():
+            bridge.follow_domain()
+            bridge.serve()
+    finally:
+        bridge.close()
 
 
 def main():
@@ -1372,9 +1358,8 @@ def main():
         "--fast",
         action="store_true",
         help="while frames flow, poll the guest's rings continuously, not only while"
-        " the guest is expected to send: memory dumps 15 (PyPy) to 35 (CPython) percent"
-        " faster, but keeps a dom0 CPU busy until %g s after the last frame"
-        % ACTIVE_PERIOD,
+        " the guest is expected to send: faster memory dumps, but keeps a dom0 CPU busy"
+        " for a moment after the last frame",
     )
     parser.add_argument(
         "-v",
