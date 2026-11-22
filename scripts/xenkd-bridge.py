@@ -1161,41 +1161,33 @@ class UdpProxy:
             if self.args.verbose:
                 log("dropping %d bytes from the debugger: no guest yet" % len(payload))
             return None
+        return self.frame_for_guest(payload)
+
+    def frame_for_guest(self, payload):
+        """Wrap a datagram from the debugger in the frame the guest would get if the debugger sent it directly."""
         # KDNET uses the same port on both ends, so that's the best guess until the guest says otherwise.
         guest_port = self.guest_port or self.host_port
         length = 8 + len(payload)
         self.ip_id = (self.ip_id + 1) & 0xFFFF
-
-        def udp_header(udp_checksum):
-            return struct.pack(
-                "!HHHH", self.host_port, guest_port, length, udp_checksum
-            )
-
-        def ip_header(ip_checksum):
-            return struct.pack(
-                "!BBHHHBBH4s4s",
-                0x45,
-                0,
-                20 + length,
-                self.ip_id,
-                0,
-                64,
-                IPPROTO_UDP,
-                ip_checksum,
-                self.host_ip,
-                self.guest_ip,
-            )
-
-        pseudo_header = (
-            self.host_ip + self.guest_ip + struct.pack("!BBH", 0, IPPROTO_UDP, length)
+        addresses = self.host_ip + self.guest_ip
+        ip = struct.pack(
+            "!BBHHHBB", 0x45, 0, 20 + length, self.ip_id, 0, 64, IPPROTO_UDP
         )
-        udp_checksum = checksum(pseudo_header + udp_header(0) + payload) or 0xFFFF
+        udp = struct.pack("!HHH", self.host_port, guest_port, length)
+        # Each checksum is computed with its own field zeroed. UDP's also covers a pseudo-header (the addresses,
+        # protocol and length), and goes out as 0xFFFF when it comes to 0, which would mean "no checksum".
+        ip_checksum = checksum(ip + b"\0\0" + addresses)
+        pseudo_header = addresses + struct.pack("!BBH", 0, IPPROTO_UDP, length)
+        udp_checksum = checksum(pseudo_header + udp + b"\0\0" + payload) or 0xFFFF
         return (
             self.guest_mac
             + PROXY_MAC
             + ETHERTYPE_IPV4
-            + ip_header(checksum(ip_header(0)))
-            + udp_header(udp_checksum)
+            + ip
+            + struct.pack("!H", ip_checksum)
+            + addresses
+            + udp
+            + struct.pack("!H", udp_checksum)
             + payload
         )
 

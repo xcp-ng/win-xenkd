@@ -301,9 +301,7 @@ class SharedRingsTest(unittest.TestCase):
         self.guest.send(b"")
         self.guest.send(b"")
         self.assertEqual(self.link.poll(), [])
-        self.assertEqual(
-            self.guest.get(SHM_TX_CONS), self.guest.get(SHM_TX_PROD)
-        )
+        self.assertEqual(self.guest.get(SHM_TX_CONS), self.guest.get(SHM_TX_PROD))
         self.guest.send(frame(1))
         self.assertEqual(self.link.poll(), [frame(1)])
         self.assertEqual(len(self.memory.map_calls), 2)
@@ -313,9 +311,7 @@ class SharedRingsTest(unittest.TestCase):
         before = self.guest.get(SHM_DOM0_HEARTBEAT)
         self.link.poll()
         self.link.poll()
-        self.assertEqual(
-            self.guest.get(SHM_DOM0_HEARTBEAT), (before + 2) & 0xFFFFFFFF
-        )
+        self.assertEqual(self.guest.get(SHM_DOM0_HEARTBEAT), (before + 2) & 0xFFFFFFFF)
 
     def test_announce_while_attached(self):
         self.attach()
@@ -352,7 +348,9 @@ class SharedRingsTest(unittest.TestCase):
 
     def test_bad_signature(self):
         for signature in (
-            0, 0x53444B58, bridge.cdefs.XENKD_SHM_SIGNATURE ^ 1,
+            0,
+            0x53444B58,
+            bridge.cdefs.XENKD_SHM_SIGNATURE ^ 1,
             bridge.cdefs.XENKD_SHM_SIGNATURE ^ (1 << 24),
         ):
             with self.subTest(signature=signature):
@@ -507,9 +505,7 @@ class SharedRingsTest(unittest.TestCase):
         self.assertFalse(self.link.attached)
         self.assertEqual(self.memory.mapped, 0)
         # Once invalidated, even the detach path must stop writing into the header.
-        self.assertEqual(
-            self.guest.get(SHM_DOM0_GENERATION), self.guest.generation
-        )
+        self.assertEqual(self.guest.get(SHM_DOM0_GENERATION), self.guest.generation)
 
     def test_guest_shutdown(self):
         self.attach()
@@ -529,9 +525,7 @@ class SharedRingsTest(unittest.TestCase):
 
     def test_bad_indices(self):
         self.attach()
-        self.guest.set(
-            SHM_TX_PROD, self.guest.get(SHM_TX_PROD) + TX_SLOTS + 1
-        )
+        self.guest.set(SHM_TX_PROD, self.guest.get(SHM_TX_PROD) + TX_SLOTS + 1)
         self.assertEqual(self.link.poll(), [])
         self.assertFalse(self.link.attached)
 
@@ -731,8 +725,8 @@ class IoreqTest(unittest.TestCase):
         self.dm.xendevicemodel_open.return_value = 1
         self.evt.xenevtchn_open.return_value = 2
         self.evt.xenevtchn_fd.return_value = 3
-        self.evt.xenevtchn_bind_interdomain.side_effect = (
-            lambda handle, domid, remote: remote + 100
+        self.evt.xenevtchn_bind_interdomain.side_effect = lambda handle, domid, remote: (
+            remote + 100
         )
         self.dm.xendevicemodel_create_ioreq_server.side_effect = self.create
         self.dm.xendevicemodel_set_ioreq_server_state.side_effect = self.enable
@@ -1157,11 +1151,9 @@ class ChecksumTest(unittest.TestCase):
         proxy.host_port = 50000
         payload = (bytes(range(256)) * 6)[: bridge.MAX_FRAME - 42]
         for length in (0, 1, 2, 63, 1000, len(payload)):
-            proxy.socket = types.SimpleNamespace(
-                recvfrom=lambda size: (payload[:length], None)
-            )
-            frame = proxy.from_debugger()
+            frame = proxy.frame_for_guest(payload[:length])
             self.assertEqual(len(frame), 42 + length)
+            self.assertEqual(frame[42:], payload[:length])
             self.assertEqual(bridge.checksum(frame[14:34]), 0)
             self.assertIsNone(proxy.check_udp(frame, 20, len(frame) - 34))
 
@@ -1192,8 +1184,7 @@ class FilterTest(unittest.TestCase):
         builder = self.make_proxy()
         builder.host_ip, builder.host_port = source_ip, 5364
         builder.guest_ip, builder.guest_port = self.HOST, 5364
-        builder.socket = types.SimpleNamespace(recvfrom=lambda size: (payload, None))
-        return builder.from_debugger()
+        return builder.frame_for_guest(payload)
 
     def arp_request(self, sender_ip):
         mac = b"\x02" * 6
