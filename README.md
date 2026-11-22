@@ -9,13 +9,13 @@ debug link doesn't depend on the guest's own Xen drivers.
 
 It's fast:
 
-| Transport                                       | `.dump /f /k` of a 360 MB kernel range |
-|-------------------------------------------------|----------------------------------------|
-| hvm_serial                                      | **Too slow, does not complete**        |
-| xenkd shared rings, bridge on CPython           | **21.2 MB/s** (17 s)                   |
-| xenkd shared rings, bridge on CPython, `--fast` | **32.7 MB/s** (11 s)                   |
-| xenkd shared rings, bridge on PyPy              | **36.9 MB/s** (10 s)                   |
-| xenkd shared rings, bridge on PyPy, `--fast`    | **57.9 MB/s** (6 s)                    |
+| Transport                                       | `.dump /f /k` of a 405 MiB kernel range |
+|-------------------------------------------------|-----------------------------------------|
+| hvm_serial                                      | **Too slow, does not complete**         |
+| xenkd shared rings, bridge on CPython           | **27.0 MiB/s** (15 s)                   |
+| xenkd shared rings, bridge on CPython, `--fast` | **36.9 MiB/s** (11 s)                   |
+| xenkd shared rings, bridge on PyPy              | **50.7 MiB/s** (8 s)                    |
+| xenkd shared rings, bridge on PyPy, `--fast`    | **57.9 MiB/s** (7 s)                    |
 
 ## How it works
 
@@ -60,8 +60,8 @@ register protocol and default port are unchanged.
   `libxenforeignmemory` (with resource mapping), `libxendevicemodel` and `libxenevtchn`. The bridge uses CFFI's ABI mode
   to load the libraries and expose mapped memory directly; no compiler, Xen development headers or generated
   extension module is needed at runtime.
-- For speed, PyPy3 instead of CPython: it runs the bridge nearly twice as fast (see the table at the top), and bundles
-  CFFI. PyPy3 7.3.23 is the last release that runs on EL7-based dom0s.
+- For speed, PyPy3 instead of CPython: it runs the bridge 1.6 to 1.9 times as fast (see the table at the top), and
+  bundles CFFI. PyPy3 7.3.23 is the last release that runs on EL7-based dom0s.
 - A 64-bit Windows HVM guest with the **xenkd PCI device** (vendor `5853`, device `C201`) attached. KDNET picks its
   extensibility module by PCI vendor ID, and xenkd checks that it was loaded for this device.
 - To build: Visual Studio with the WDK.
@@ -142,7 +142,7 @@ dom0 on one UDP port, and accept packets from it.
 | `--guest-ip IP`              | any                        | The guest's `-TargetIp`; ignore other guest addresses    |
 | `--local-port PORT`          | WinDbg's port              | dom0's port; set it if WinDbg runs in dom0               |
 | `--io-port PORT`             | `0xEC`                     | Rendezvous port; matches the guest's `-IoPort`           |
-| `--fast`                     |                            | Poll continuously while frames flow (see Limitations)    |
+| `--fast`                     |                            | Spin while frames flow (see Limitations)                 |
 | `-v`, `--verbose`            |                            | Log every frame                                          |
 
 The bridge:
@@ -182,9 +182,11 @@ before enabling the new DLL if you want to restore the PV console. It cannot rec
 ## Limitations
 
 - x64 guests only.
-- dom0 polls: every 200 µs while frames flow, every 5 ms when idle. The bridge's `--fast` polls continuously while
-  frames flow instead, for about 1.5 times the throughput (see the table at the top), but keeps a dom0 CPU busy until
-  1 s after the last frame.
+- dom0 polls. It spins only while the guest is expected to send: for up to 200 µs after passing it a frame, and 50 µs
+  after each frame from it. Otherwise it waits for the debugger on its socket, and polls the guest every 200 µs while
+  frames flow, every 5 ms when idle. The bridge's `--fast` spins all the time while frames flow instead, which saves
+  waking up for each of the debugger's packets: dumps 15% (PyPy) to 35% (CPython) faster (see the table at the top),
+  but it keeps a dom0 CPU busy until 1 s after the last frame.
 - dom0 writes into guest memory that KDNET reserved. If Windows ever reused those pages while the bridge is attached,
   the bridge would corrupt them. The generation check makes that window small, which is acceptable for a debugging
   tool.
