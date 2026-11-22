@@ -9,11 +9,13 @@ debug link doesn't depend on the guest's own Xen drivers.
 
 It's fast:
 
-| Transport                             | `.dump /f /k` of a 360 MB kernel range |
-|---------------------------------------|----------------------------------------|
-| hvm_serial                            | **Too slow, does not complete**        |
-| xenkd shared rings                    | **21.2 MB/s** (17 s)                   |
-| xenkd shared rings, bridge `--fast`   | **32.7 MB/s** (11 s)                   |
+| Transport                                       | `.dump /f /k` of a 360 MB kernel range |
+|-------------------------------------------------|----------------------------------------|
+| hvm_serial                                      | **Too slow, does not complete**        |
+| xenkd shared rings, bridge on CPython           | **21.2 MB/s** (17 s)                   |
+| xenkd shared rings, bridge on CPython, `--fast` | **32.7 MB/s** (11 s)                   |
+| xenkd shared rings, bridge on PyPy              | **36.9 MB/s** (10 s)                   |
+| xenkd shared rings, bridge on PyPy, `--fast`    | **57.9 MB/s** (6 s)                    |
 
 ## How it works
 
@@ -58,6 +60,8 @@ register protocol and default port are unchanged.
   `libxenforeignmemory` (with resource mapping), `libxendevicemodel` and `libxenevtchn`. The bridge uses CFFI's ABI mode
   to load the libraries and expose mapped memory directly; no compiler, Xen development headers or generated
   extension module is needed at runtime.
+- For speed, PyPy3 instead of CPython: it runs the bridge nearly twice as fast (see the table at the top), and bundles
+  CFFI. PyPy3 7.3.23 is the last release that runs on EL7-based dom0s.
 - A 64-bit Windows HVM guest with the **xenkd PCI device** (vendor `5853`, device `C201`) attached. KDNET picks its
   extensibility module by PCI vendor ID, and xenkd checks that it was loaded for this device.
 - To build: Visual Studio with the WDK.
@@ -110,6 +114,8 @@ Copy [scripts/xenkd-bridge.py](scripts/xenkd-bridge.py) to dom0 (with LF line en
 ```sh
 ./xenkd-bridge.py <domain UUID, name or domid>
 ```
+
+or, with PyPy, `pypy3 xenkd-bridge.py <domain>`.
 
 The bridge follows the domain across reboots, which change its domid:
 
@@ -187,5 +193,3 @@ before enabling the new DLL if you want to restore the PV console. It cannot rec
   registered in dom0; restarting the bridge is not guaranteed to recover it. Run only one bridge per guest.
 - The header PFN must fit in 32 bits (below 16 TiB, excluding PFN `0xFFFFFFFF`); other ring PFNs remain 64-bit.
 - Save/restore and live migration are untested.
-- With `--fast`, most of each round trip is spent outside the bridge (in the guest, the network and WinDbg), so a
-  faster bridge would gain little. PyPy is no help either: a PyPy build of the bridge managed only 9.0 MB/s.
