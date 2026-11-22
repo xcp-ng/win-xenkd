@@ -122,7 +122,7 @@ def read_domain(domid, key):
 def find_domains(key, value):
     """The domids of the running domains, other than dom0, whose UUID or name (key) is value."""
     domids = (query("xenstore-list", "/local/domain") or "").split()
-    return [d for d in domids if d != "0" and read_domain(d, key) == value]
+    return [int(d) for d in domids if d != "0" and read_domain(d, key) == value]
 
 
 def follow_key():
@@ -138,11 +138,11 @@ def resolve_domain(domain, key):
         given = None if domain.isdigit() else "name"
     if given == key:
         return domain
-    domids = find_domains(given, domain) if given else [domain]
+    domids = find_domains(given, domain) if given else [int(domain)]
     if len(domids) > 1:
         raise SystemExit(
             "domains %s are all named %s: give the UUID of one"
-            % (", ".join(domids), domain)
+            % (", ".join(str(domid) for domid in domids), domain)
         )
     value = read_domain(domids[0], key) if domids else None
     what = "UUID" if key == "vm" else "name"
@@ -387,7 +387,7 @@ class ForeignMemory:
         errors = ffi.new("int[]", count)
         address = self.lib.xenforeignmemory_map(
             self.handle,
-            int(domid),
+            domid,
             mmap.PROT_READ | mmap.PROT_WRITE,
             count,
             ffi.new("xen_pfn_t[]", gfns),
@@ -414,7 +414,7 @@ class ForeignMemory:
         # memory.h: frame_ioreq(0) = 1 (frame 0 is the buffered ring). CFFI cannot declare function-like macros.
         resource = self.lib.xenforeignmemory_map_resource(
             self.handle,
-            int(domid),
+            domid,
             cdefs.XENMEM_resource_ioreq_server,
             server_id,
             1,
@@ -456,7 +456,7 @@ class IoreqServer:
     """A secondary emulator for one four-byte rendezvous register. It never acquires guest xenbus bindings."""
 
     def __init__(self, domid, io_port, memory):
-        self.domid, self.io_port, self.memory = int(domid), io_port, memory
+        self.domid, self.io_port, self.memory = domid, io_port, memory
         self.dm_handle = self.evt_handle = self.server_id = None
         self.resource = self.requests = self.fd = None
         self.enabled = False
@@ -537,10 +537,10 @@ class IoreqServer:
             )
             if scalar:
                 if request.dir == cdefs.IOREQ_READ:
-                    request.data = link.accepted_pfn(str(self.domid))
+                    request.data = link.accepted_pfn(self.domid)
                 else:
                     # Keep the issuing vCPU stopped until mapping/unmapping finishes, especially on shutdown.
-                    link.announce(str(self.domid), request.data & INDEX_MASK)
+                    link.announce(self.domid, request.data & INDEX_MASK)
             elif request.dir == cdefs.IOREQ_READ and not request.data_is_ptr:
                 request.data = 0xFFFFFFFFFFFFFFFF
         finally:
@@ -1211,7 +1211,7 @@ def run(args, stopping):
             # Domain lookups run commands, so defer them while packet traffic is active.
             changed = domain.poll() if not link.busy() else False
             link.follow(domain)
-            if server is not None and str(server.domid) != domain.domid:
+            if server is not None and server.domid != domain.domid:
                 server.close()
                 server = None
             if changed and domain.domid is not None:

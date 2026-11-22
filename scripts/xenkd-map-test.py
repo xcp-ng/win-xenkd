@@ -24,7 +24,7 @@ if domid is None or gfn is None:
     sys.exit("cannot find the console ring of domain %s" % domain)
 
 memory = bridge.ForeignMemory()
-address = memory.map(domid, [int(gfn)])
+address = memory.map(int(domid), [int(gfn)])
 # struct xencons_interface: in[1024], out[2048], then in_cons, in_prod, out_cons, out_prod.
 page = bridge.ffi.buffer(address, bridge.PAGE_SIZE)
 in_cons, in_prod, out_cons, out_prod = struct.unpack_from("<4I", page, 3072)

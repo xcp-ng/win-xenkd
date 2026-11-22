@@ -30,7 +30,7 @@ PAGES = 1 + (TX_SLOTS + RX_SLOTS) * SLOT_SIZE // PAGE_SIZE
 TX_OFFSET = PAGE_SIZE
 RX_OFFSET = PAGE_SIZE + TX_SLOTS * SLOT_SIZE
 BASE_GFN = 0x1000
-DOMID = "7"
+DOMID = 7
 SHM_HEADER_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "xenkd", "xenkd_shm.h"
 )
@@ -580,7 +580,7 @@ class ForeignMemoryTest(unittest.TestCase):
 
         def map_pages(handle, domid, prot, pages, array, errors):
             self.assertEqual(handle, self.handle)
-            self.assertEqual((domid, prot, pages), (int(DOMID), 0x50, 2))
+            self.assertEqual((domid, prot, pages), (DOMID, 0x50, 2))
             self.assertEqual(list(array), gfns)
             self.assertEqual(list(errors), [0, 0])
             return raw
@@ -625,14 +625,14 @@ class ForeignMemoryTest(unittest.TestCase):
             self.assertEqual(handle, self.handle)
             self.assertEqual(
                 (domid, kind, server, frame, pages, prot, flags),
-                (int(DOMID), 0, 7, 1, 1, 0x50, 0),
+                (DOMID, 0, 7, 1, 1, 0x50, 0),
             )
             self.assertEqual(address[0], bridge.ffi.NULL)
             address[0] = raw
             return self.resource
 
         self.lib.xenforeignmemory_map_resource.side_effect = map_resource
-        resource, requests = self.memory.map_ioreq(int(DOMID), 7)
+        resource, requests = self.memory.map_ioreq(DOMID, 7)
         requests[0].vp_eport = 0x1234
         self.assertEqual(bytes(bridge.ffi.buffer(raw + 24, 4)), b"\x34\x12\x00\x00")
         self.memory.unmap_ioreq(resource)
@@ -647,7 +647,7 @@ class ForeignMemoryTest(unittest.TestCase):
 
         self.lib.xenforeignmemory_map_resource.side_effect = map_resource
         with self.assertRaises(OSError) as raised:
-            self.memory.map_ioreq(int(DOMID), 7)
+            self.memory.map_ioreq(DOMID, 7)
         self.assertEqual(raised.exception.errno, errno.EINVAL)
         self.lib.xenforeignmemory_unmap_resource.assert_not_called()
 
@@ -787,15 +787,11 @@ class IoreqTest(unittest.TestCase):
         server = self.server(0xE0)
         self.assertEqual(server.ports, {111: 0, 112: 1})
         self.dm.xendevicemodel_map_io_range_to_ioreq_server.assert_called_once_with(
-            1, int(DOMID), 7, 0, 0xE0, 0xE3
+            1, DOMID, 7, 0, 0xE0, 0xE3
         )
         server.close()
-        self.dm.xendevicemodel_set_ioreq_server_state.assert_called_with(
-            1, int(DOMID), 7, 0
-        )
-        self.dm.xendevicemodel_destroy_ioreq_server.assert_called_once_with(
-            1, int(DOMID), 7
-        )
+        self.dm.xendevicemodel_set_ioreq_server_state.assert_called_with(1, DOMID, 7, 0)
+        self.dm.xendevicemodel_destroy_ioreq_server.assert_called_once_with(1, DOMID, 7)
         self.assertFalse(self.memory.resource_mapped)
         self.assertIsNone(server.fd)
         # close() is idempotent, including cleanup callbacks.
@@ -812,7 +808,7 @@ class IoreqTest(unittest.TestCase):
 
         def notify(handle, local):
             self.dm.xendevicemodel_set_ioreq_server_state.assert_called_with(
-                1, int(DOMID), 7, 0
+                1, DOMID, 7, 0
             )
             self.dm.xendevicemodel_destroy_ioreq_server.assert_not_called()
             self.assertTrue(self.memory.resource_mapped)
@@ -962,7 +958,7 @@ class ShutdownTest(unittest.TestCase):
             handlers[bridge.signal.SIGTERM](bridge.signal.SIGTERM, None)
             self.assertTrue(stopping())
 
-        argv = ["xenkd-bridge.py", DOMID, "192.0.2.7:50000"]
+        argv = ["xenkd-bridge.py", str(DOMID), "192.0.2.7:50000"]
         with mock.patch.object(bridge.sys, "argv", argv):
             with mock.patch.object(bridge.signal, "signal", side_effect=set_signal):
                 with mock.patch.object(bridge, "run", side_effect=run) as mocked_run:
@@ -1051,14 +1047,14 @@ class DomainTest(unittest.TestCase):
     def follow(self, key, value, rebooted_uuid):
         domain = bridge.Domain(key, value)
         self.assertTrue(domain.poll())
-        self.assertEqual(domain.domid, "3")
+        self.assertEqual(domain.domid, 3)
         domain.next_check = 0.0
         self.assertFalse(domain.poll())
         self.xenstore.remove_domain(3)
         self.xenstore.add_domain(9, rebooted_uuid, "win11")
         domain.next_check = 0.0
         self.assertTrue(domain.poll())
-        self.assertEqual(domain.domid, "9")
+        self.assertEqual(domain.domid, 9)
         self.xenstore.remove_domain(9)
         domain.next_check = 0.0
         self.assertTrue(domain.poll())
