@@ -1152,16 +1152,23 @@ class UdpProxy:
         return [reply.ljust(60, b"\0")]
 
     def from_debugger(self):
-        """Read a datagram from the debugger, and return it as a frame for the guest (or None)."""
-        try:
-            payload, _ = self.socket.recvfrom(65535)
-        except (BlockingIOError, ConnectionRefusedError):
-            return None
-        if None in (self.guest_mac, self.guest_ip, self.host_ip, self.host_port):
-            if self.args.verbose:
-                log("dropping %d bytes from the debugger: no guest yet" % len(payload))
-            return None
-        return self.frame_for_guest(payload)
+        """Read the datagrams waiting from the debugger, and return them as frames for the guest. Reads at most what
+        the guest's RX ring holds: the rest waits for the next call."""
+        frames = []
+        for _ in range(cdefs.XENKD_SHM_RX_SLOTS):
+            try:
+                payload = self.socket.recv(65535)
+            except (BlockingIOError, ConnectionRefusedError):
+                break
+            if None in (self.guest_mac, self.guest_ip, self.host_ip, self.host_port):
+                if self.args.verbose:
+                    log(
+                        "dropping %d bytes from the debugger: no guest yet"
+                        % len(payload)
+                    )
+            else:
+                frames.append(self.frame_for_guest(payload))
+        return frames
 
     def frame_for_guest(self, payload):
         """Wrap a datagram from the debugger in the frame the guest would get if the debugger sent it directly."""
@@ -1200,6 +1207,8 @@ def run(args, stopping):
     error = None
 
     def send_to_guest(frame):
+        if not link.attached:
+            return
         if args.verbose:
             log("proxy > guest: %s" % describe_frame(frame))
         link.send(frame)
@@ -1265,8 +1274,7 @@ def run(args, stopping):
                     for reply in proxy.from_guest(frame):
                         send_to_guest(reply)
                 if proxy.socket in readable:
-                    frame = proxy.from_debugger()
-                    if frame is not None and link.attached:
+                    for frame in proxy.from_debugger():
                         send_to_guest(frame)
                 if config_read or time.monotonic() >= spin_until:
                     break

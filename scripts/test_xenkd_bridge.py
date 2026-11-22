@@ -1205,6 +1205,27 @@ class FilterTest(unittest.TestCase):
         self.assertEqual(proxy.sent, [b"hello"])
         self.assertEqual((proxy.host_ip, proxy.host_port), (self.HOST, 5364))
 
+    def test_reads_every_waiting_datagram(self):
+        proxy = self.make_proxy()
+        proxy.host_ip, proxy.host_port = self.HOST, 5364
+        waiting = [b"%d" % number for number in range(RX_SLOTS + 2)]
+
+        def recv(size):
+            if not waiting:
+                raise BlockingIOError
+            return waiting.pop(0)
+
+        proxy.socket = types.SimpleNamespace(recv=recv)
+        # No more at once than the guest's RX ring holds.
+        self.assertEqual(
+            [frame[42:] for frame in proxy.from_debugger()],
+            [b"%d" % number for number in range(RX_SLOTS)],
+        )
+        self.assertEqual(
+            [frame[42:] for frame in proxy.from_debugger()], [b"16", b"17"]
+        )
+        self.assertEqual(proxy.from_debugger(), [])
+
     def test_ignores_other_hosts(self):
         proxy = self.make_proxy()
         proxy.from_guest(self.guest_frame(self.OTHER))
