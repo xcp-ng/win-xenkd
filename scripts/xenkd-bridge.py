@@ -1001,39 +1001,26 @@ class UdpProxy:
     def __init__(self, args):
         self.args = args
         self.socket = None
-        # The guest's end (MAC, IP, UDP port), and the debugger as the guest addresses it (IP, UDP port).
+        # The guest's end (MAC, IP, UDP port), learned from its frames unless given.
         self.guest_mac = self.guest_ip = self.guest_port = None
-        self.host_ip = self.host_port = None
-        self.destination = None
         self.ip_id = 0
         self.dhcp_logged = False
         self.corrupted = DropCounter("damaged frame from the guest")
 
         if args.guest_ip:
             self.guest_ip = socket.inet_aton(args.guest_ip)
-        if args.debugger is not None:
-            # The guest's HOST_IP and HOST_PORT are the debugger's address, until it says otherwise.
-            try:
-                self.host_ip = resolve_ipv4(args.debugger[0])
-            except OSError:
-                pass
-            self.host_port = args.debugger[1]
-        if args.destination is not None:
-            # Replies can go out before the guest has sent anything.
-            try:
-                self.destination = (
-                    resolve_ipv4(args.destination[0]),
-                    args.destination[1],
-                )
-            except OSError as e:
-                raise SystemExit("bad --destination %s: %s" % (args.destination[0], e))
-            self.host_ip, self.host_port = self.destination
-            log(
-                "only forwarding UDP the guest sends to %s:%d"
-                % (socket.inet_ntoa(self.destination[0]), self.destination[1])
-            )
-        else:
-            log("forwarding UDP the guest sends to any address")
+        # The debugger as the guest addresses it, its HOST_IP and port: the only address its frames may go to, and
+        # where replies come from. Where the debugger really is is decided in dom0 (debugger()), never by the guest:
+        # dom0 can reach networks the guest can't.
+        try:
+            self.host_ip = resolve_ipv4(args.destination[0])
+        except OSError as e:
+            raise SystemExit("bad --destination %s: %s" % (args.destination[0], e))
+        self.host_port = args.destination[1]
+        log(
+            "only forwarding UDP the guest sends to %s:%d"
+            % (socket.inet_ntoa(self.host_ip), self.host_port)
+        )
         if self.guest_ip is not None:
             log("only talking to guest %s" % socket.inet_ntoa(self.guest_ip))
         else:
@@ -1094,20 +1081,12 @@ class UdpProxy:
                     " NO_DHCP (and TARGET_IP) to skip the wait for a link-local address"
                 )
             return []
-        if self.destination not in (None, (frame[30:34], destination_port)):
+        if (frame[30:34], destination_port) != (self.host_ip, self.host_port):
             return []
 
         guest = frame[6:12], frame[26:30], source_port
-        host = frame[30:34], destination_port
-        if guest + host != (
-            self.guest_mac,
-            self.guest_ip,
-            self.guest_port,
-            self.host_ip,
-            self.host_port,
-        ):
+        if guest != (self.guest_mac, self.guest_ip, self.guest_port):
             self.guest_mac, self.guest_ip, self.guest_port = guest
-            self.host_ip, self.host_port = host
             log(
                 "guest %s:%d talks to %s:%d, forwarding to %s:%d"
                 % (
@@ -1153,12 +1132,10 @@ class UdpProxy:
         # where replies go.
         if self.guest_ip is not None and sender_ip != self.guest_ip:
             return []
-        if self.destination is not None and target_ip != self.destination[0]:
+        if target_ip != self.host_ip:
             return []
         # A restarted bridge may see ARP before any UDP, when it has to learn the guest's address (--guest-ip '').
         self.guest_mac, self.guest_ip = sender_mac, sender_ip
-        if self.host_ip is None:
-            self.host_ip = target_ip
         reply = (
             sender_mac
             + PROXY_MAC
@@ -1180,7 +1157,7 @@ class UdpProxy:
                 payload = self.socket.recv(65535)
             except (BlockingIOError, ConnectionRefusedError):
                 break
-            if None in (self.guest_mac, self.guest_ip, self.host_ip, self.host_port):
+            if None in (self.guest_mac, self.guest_ip):
                 if self.args.verbose:
                     log(
                         "dropping %d bytes from the debugger: no guest yet"

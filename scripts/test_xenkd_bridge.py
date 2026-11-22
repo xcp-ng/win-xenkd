@@ -1167,14 +1167,12 @@ class ChecksumTest(unittest.TestCase):
         proxy = bridge.UdpProxy(
             types.SimpleNamespace(
                 guest_ip="169.254.0.2",
-                destination=None,
+                destination=("169.254.0.1", 50000),
                 debugger=None,
                 local_port=None,
             )
         )
         proxy.guest_mac = b"\x02" * 6
-        proxy.host_ip = b"\xa9\xfe\x00\x01"
-        proxy.host_port = 50000
         payload = (bytes(range(256)) * 6)[: bridge.MAX_FRAME - 42]
         for length in (0, 1, 2, 63, 1000, len(payload)):
             frame = proxy.frame_for_guest(payload[:length])
@@ -1189,7 +1187,7 @@ class FilterTest(unittest.TestCase):
     OTHER = b"\xa9\xfe\x77\x28"
     HOST = b"\xa9\xfe\x00\x01"
 
-    def make_proxy(self, guest_ip="169.254.0.2", destination=None):
+    def make_proxy(self, guest_ip="169.254.0.2", destination=("169.254.0.1", 5364)):
         proxy = bridge.UdpProxy(
             types.SimpleNamespace(
                 guest_ip=guest_ip,
@@ -1233,7 +1231,6 @@ class FilterTest(unittest.TestCase):
 
     def test_reads_every_waiting_datagram(self):
         proxy = self.make_proxy()
-        proxy.host_ip, proxy.host_port = self.HOST, 5364
         waiting = [b"%d" % number for number in range(RX_SLOTS + 2)]
 
         def recv(size):
@@ -1256,20 +1253,12 @@ class FilterTest(unittest.TestCase):
         proxy = self.make_proxy()
         proxy.from_guest(self.guest_frame(self.OTHER))
         self.assertEqual(proxy.sent, [])
-        self.assertIsNone(proxy.host_ip)
         self.assertIsNone(proxy.guest_port)
 
     def test_ignores_other_arp(self):
         proxy = self.make_proxy()
         self.assertEqual(proxy.arp(self.arp_request(self.OTHER)), [])
         self.assertEqual(len(proxy.arp(self.arp_request(self.GUEST))), 1)
-
-    def test_any_destination_by_default(self):
-        proxy = self.make_proxy()
-        self.assertIsNone(proxy.host_ip)
-        proxy.from_guest(self.guest_frame(self.GUEST))
-        self.assertEqual(proxy.sent, [b"hello"])
-        self.assertEqual((proxy.host_ip, proxy.host_port), (self.HOST, 5364))
 
     def test_filters_by_destination(self):
         # The guest's frames are for HOST:5364.
