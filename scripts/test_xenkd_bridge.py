@@ -911,6 +911,11 @@ class ShutdownTest(unittest.TestCase):
             # Repeated signals must also let cleanup finish.
             handlers[bridge.signal.SIGTERM](bridge.signal.SIGTERM, None)
             self.assertTrue(stopping())
+            # Losing the terminal stops the bridge the same way.
+            if hasattr(bridge.signal, "SIGHUP"):
+                self.assertIs(
+                    handlers[bridge.signal.SIGHUP], handlers[bridge.signal.SIGINT]
+                )
 
         # run() is replaced, so the arguments don't matter: don't depend on the command line.
         parser, args = bridge.argparse.ArgumentParser, types.SimpleNamespace()

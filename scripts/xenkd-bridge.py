@@ -75,7 +75,11 @@ DEFAULT_DESTINATION = "169.254.0.1:5364"
 
 
 def log(message):
-    print(message, file=sys.stderr, flush=True)
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except OSError:
+        # The terminal went away (SIGHUP): losing the message beats failing an operation, or the cleanup after it.
+        pass
 
 
 def format_mac(mac):
@@ -1378,6 +1382,9 @@ def main():
 
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
+    # Losing the terminal would otherwise kill the bridge without cleanup. Windows, where the tests also run, has none.
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, request_stop)
     # With SIGINT handled above, Ctrl+C sets the flag instead of raising KeyboardInterrupt.
     try:
         run(args, lambda: stop_requested)
