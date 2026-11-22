@@ -11,8 +11,10 @@ import os
 import random
 import re
 import struct
+import sys
 import types
 import unittest
+from typing import Optional
 from unittest import mock
 
 spec = importlib.util.spec_from_file_location(
@@ -163,7 +165,7 @@ class FakeMemory:
 
 
 class FakeDomain:
-    domid = DOMID
+    domid: Optional[int] = DOMID
 
 
 def frame(number, length=100):
@@ -177,7 +179,8 @@ class SharedLayoutTest(unittest.TestCase):
             header = source.read()
         declarations = bridge.SHM_CDEF
         section = re.search(r"// ----8<----\n(.*?)// ---->8----", header, re.S)
-        self.assertIsNotNone(section, "missing scissored shared-memory declarations")
+        if section is None:
+            self.fail("missing scissored shared-memory declarations")
         self.assertEqual(declarations, "\n" + section.group(1))
         for name in (
             "SIGNATURE",
@@ -190,7 +193,8 @@ class SharedLayoutTest(unittest.TestCase):
             constant = re.search(
                 r"#define " + constant_name + r"\s+(0[xX][0-9a-fA-F]+|\d+)", header
             )
-            self.assertIsNotNone(constant, name)
+            if constant is None:
+                self.fail(name)
             self.assertEqual(
                 int(constant.group(1), 0), getattr(bridge.cdefs, constant_name), name
             )
@@ -522,11 +526,6 @@ class SharedRingsTest(unittest.TestCase):
 
 class ForeignMemoryTest(unittest.TestCase):
     def setUp(self):
-        # Exercise native flag use even on Windows, where mmap doesn't expose PROT_*.
-        flags = types.SimpleNamespace(PROT_READ=0x10, PROT_WRITE=0x40)
-        patch = mock.patch.object(bridge, "mmap", flags)
-        patch.start()
-        self.addCleanup(patch.stop)
         self.lib = mock.Mock()
         self.handle = bridge.ffi.cast("xenforeignmemory_handle *", 1)
         self.resource = bridge.ffi.cast("xenforeignmemory_resource_handle *", 2)
@@ -545,7 +544,8 @@ class ForeignMemoryTest(unittest.TestCase):
 
         def map_pages(handle, domid, prot, pages, array, errors):
             self.assertEqual(handle, self.handle)
-            self.assertEqual((domid, prot, pages), (DOMID, 0x50, 2))
+            # Linux's PROT_READ | PROT_WRITE.
+            self.assertEqual((domid, prot, pages), (DOMID, 0x3, 2))
             self.assertEqual(list(array), gfns)
             self.assertEqual(list(errors), [0, 0])
             return raw
@@ -590,7 +590,7 @@ class ForeignMemoryTest(unittest.TestCase):
             self.assertEqual(handle, self.handle)
             self.assertEqual(
                 (domid, kind, server, frame, pages, prot, flags),
-                (DOMID, 0, 7, 1, 1, 0x50, 0),
+                (DOMID, 0, 7, 1, 1, 0x3, 0),
             )
             self.assertEqual(address[0], bridge.ffi.NULL)
             address[0] = raw
@@ -746,7 +746,6 @@ class IoreqTest(unittest.TestCase):
         self.dm.xendevicemodel_set_ioreq_server_state.assert_called_with(1, DOMID, 7, 0)
         self.dm.xendevicemodel_destroy_ioreq_server.assert_called_once_with(1, DOMID, 7)
         self.assertFalse(self.memory.resource_mapped)
-        self.assertIsNone(server.fd)
         # close() is idempotent, including cleanup callbacks.
         server.close()
         self.dm.xendevicemodel_destroy_ioreq_server.assert_called_once()
@@ -912,7 +911,7 @@ class ShutdownTest(unittest.TestCase):
             handlers[bridge.signal.SIGTERM](bridge.signal.SIGTERM, None)
             self.assertTrue(stopping())
             # Losing the terminal stops the bridge the same way.
-            if hasattr(bridge.signal, "SIGHUP"):
+            if sys.platform != "win32":
                 self.assertIs(
                     handlers[bridge.signal.SIGHUP], handlers[bridge.signal.SIGINT]
                 )

@@ -1,0 +1,40 @@
+# The bridge runs on dom0's Python 3.6 (see AGENTS.md). Ruff can't target anything older than 3.7, so 3.7 additions
+# are banned by name below, and the rule sets that rewrite code into newer idioms (pyupgrade's UP, flynt's FLY, the
+# future-annotations FA) aren't enabled. Nothing here catches f-strings or subprocess.run(capture_output=...): running
+# the tests under 3.6 does.
+target-version = "py37"
+# Black-style layout for code; comments and docstrings go to 120 (E501 below).
+line-length = 88
+
+[format]
+quote-style = "double"
+
+[lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # import order
+    "TID", # banned APIs (below)
+]
+
+[lint.pycodestyle]
+max-line-length = 120
+
+[lint.flake8-tidy-imports.banned-api]
+"__future__.annotations".msg = "3.7+: quote forward references instead"
+"dataclasses".msg = "3.7+"
+"contextlib.nullcontext".msg = "3.7+"
+"contextlib.asynccontextmanager".msg = "3.7+"
+"importlib.resources".msg = "3.7+"
+"time.monotonic_ns".msg = "3.7+"
+"time.time_ns".msg = "3.7+"
+"time.perf_counter_ns".msg = "3.7+"
+"typing.ForwardRef".msg = "3.7+"
+"typing.Final".msg = "3.8+"
+"typing.Literal".msg = "3.8+"
+"typing.Protocol".msg = "3.8+"
+"typing.TypedDict".msg = "3.8+"
+"typing.Annotated".msg = "3.9+"
+"typing.TypeAlias".msg = "3.10+"
+"typing_extensions".msg = "not in the standard library"

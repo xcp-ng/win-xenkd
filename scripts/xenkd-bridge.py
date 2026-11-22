@@ -28,8 +28,28 @@ import subprocess
 import sys
 import time
 import uuid
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
 
 from cffi import FFI
+
+# Annotations stick to what Python 3.6 evaluates: typing's generics, and quotes around names defined further down or
+# only for type checkers. A CFFI pointer or library whose type adds nothing is CData.
+CData = Any
+# A host and port.
+Address = Tuple[str, int]
+# A mapping of guest pages: its address in dom0, and how many pages.
+PageMapping = Tuple[CData, int]
 
 # The largest Ethernet frame (without FCS) that xenkd sends or accepts (XENKD_MAX_FRAME).
 MAX_FRAME = 1514
@@ -51,6 +71,11 @@ FAST_SPIN = 0.05
 
 # Xen uses 4 KiB pages; shared-memory geometry and signature come from the CFFI declarations below.
 PAGE_SIZE = 4096
+# For mapping guest memory. Python's mmap has no PROT_* on Windows, where only the tests run: use Linux's values there.
+if sys.platform == "win32":
+    PROT_READ_WRITE = 0x1 | 0x2
+else:
+    PROT_READ_WRITE = mmap.PROT_READ | mmap.PROT_WRITE
 INDEX_MASK = 0xFFFFFFFF
 # Rendezvous v1 (XENKD_DEFAULT_IO_PORT / XENKD_IO_DETACH). A port change is an explicit choice on both ends.
 DEFAULT_IO_PORT = 0xEC
@@ -74,7 +99,7 @@ PROXY_MAC = b"\x02\x00\x00\x6b\x64\x00"
 DEFAULT_DESTINATION = "169.254.0.1:5364"
 
 
-def log(message):
+def log(message: str) -> None:
     try:
         print(message, file=sys.stderr, flush=True)
     except OSError:
@@ -82,11 +107,11 @@ def log(message):
         pass
 
 
-def format_mac(mac):
+def format_mac(mac: bytes) -> str:
     return ":".join("%02x" % b for b in mac)
 
 
-def describe_frame(frame):
+def describe_frame(frame: bytes) -> str:
     """One line about a frame, for --verbose."""
     ethertype = frame[12:14]
     if ethertype == ETHERTYPE_ARP and len(frame) >= 42:
@@ -102,7 +127,7 @@ def describe_frame(frame):
     return "%s, %d bytes" % (what, len(frame))
 
 
-def query(*command):
+def query(*command: str) -> Optional[str]:
     """Run a command, and return its output, or None if it fails or prints nothing."""
     result = subprocess.run(
         command,
@@ -115,7 +140,7 @@ def query(*command):
     return result.stdout.strip() or None
 
 
-def read_domain(domid, key):
+def read_domain(domid: Union[int, str], key: str) -> Optional[str]:
     """A domain's UUID (key "vm", which holds /vm/<uuid>) or name (key "name"), or None."""
     value = query("xenstore-read", "/local/domain/%s/%s" % (domid, key))
     if value and key == "vm":
@@ -123,18 +148,18 @@ def read_domain(domid, key):
     return value
 
 
-def find_domains(key, value):
+def find_domains(key: str, value: str) -> List[int]:
     """The domids of the running domains, other than dom0, whose UUID or name (key) is value."""
     domids = (query("xenstore-list", "/local/domain") or "").split()
     return [int(d) for d in domids if d != "0" and read_domain(d, key) == value]
 
 
-def follow_key():
+def follow_key() -> str:
     """What identifies a domain across reboots: its UUID with XAPI, its name with xl (see the module's docstring)."""
     return "vm" if os.path.exists(XAPI_INVENTORY) else "name"
 
 
-def resolve_domain(domain, key):
+def resolve_domain(domain: str, key: str) -> str:
     """The UUID or name (key) to follow the domain by, given its UUID, domid or name."""
     if domain.isdigit():
         domids = [int(domain)]
@@ -165,7 +190,7 @@ def resolve_domain(domain, key):
     return value
 
 
-def kdnet_mac(smbios_uuid):
+def kdnet_mac(smbios_uuid: str) -> bytes:
     """The MAC KDNET gives itself: an HMAC of the SMBIOS UUID (the domain's), locally administered."""
     digest = hmac.new(b"MAC_KEY\0", uuid.UUID(smbios_uuid).bytes, hashlib.sha256)
     mac = bytearray(digest.digest()[:6])
@@ -177,19 +202,20 @@ def kdnet_mac(smbios_uuid):
 class Domain:
     """Follow a guest's identity without acquiring its console."""
 
-    def __init__(self, key, value):
+    def __init__(self, key: str, value: str) -> None:
         """Follow the domain whose UUID (key "vm") or name (key "name") is value."""
         self.key, self.value = key, value
-        self.domid = self.status = None
+        self.domid: Optional[int] = None
+        self.status: Optional[str] = None
         self.next_check = 0.0
 
-    def set_status(self, status):
+    def set_status(self, status: str) -> None:
         # Log state changes only, not every check.
         if status != self.status:
             self.status = status
             log(status)
 
-    def poll(self):
+    def poll(self) -> bool:
         """Return True when the domain changes, including disappearance."""
         now = time.monotonic()
         if now < self.next_check:
@@ -210,12 +236,12 @@ class Domain:
             self.set_status("following domain %s" % self.domid)
         return old != self.domid
 
-    def lose(self):
+    def lose(self) -> None:
         """Forget the domain after an error showing it's gone, and look for it again right away."""
         self.domid = None
         self.next_check = 0.0
 
-    def time_to_poll(self):
+    def time_to_poll(self) -> float:
         """How long until poll() has something to check."""
         return max(0.0, self.next_check - time.monotonic())
 
@@ -384,19 +410,69 @@ typedef struct _XENKD_SHM {
 ffi.cdef(SHM_CDEF)
 # Literal constants are exposed through a library namespace without looking up C symbols. Use the process handle
 # on dom0; an explicit C runtime library also lets the offline tests import this module on Windows.
-cdefs = ffi.dlopen("msvcrt.dll" if os.name == "nt" else None)
+# Its attributes come from the cdefs above, which type checkers can't see.
+cdefs: CData = ffi.dlopen("msvcrt.dll" if sys.platform == "win32" else None)
+
+if TYPE_CHECKING:
+    # What CFFI exposes of the structures declared above, for type checkers only: at run time, these are CFFI
+    # pointers, whose fields read and write Xen's or the guest's memory. Keep them in step with the declarations.
+
+    class Ioreq:
+        """ioreq_t."""
+
+        addr: int
+        data: int
+        count: int
+        size: int
+        vp_eport: int
+        state: int
+        data_is_ptr: int
+        dir: int
+        df: int
+        type: int
+
+    class IoreqPage:
+        """ioreq_t *, to the server's request page: one request per vCPU."""
+
+        def __getitem__(self, cpu: int) -> Ioreq: ...
+
+    class ShmHeader:
+        """PXENKD_SHM_HEADER."""
+
+        Signature: int
+        Generation: int
+        RingGfn: Sequence[int]
+        TxProd: int
+        TxCons: int
+        RxProd: int
+        RxCons: int
+        Dom0Generation: int
+        Dom0Heartbeat: int
+
+    class ShmSlot:
+        """XENKD_SHM_SLOT."""
+
+        Length: int
+        Data: CData
+
+    class ShmSlots:
+        """PXENKD_SHM_SLOT, to an array of slots."""
+
+        def __getitem__(self, index: int) -> ShmSlot: ...
+
+        def __add__(self, count: int) -> "ShmSlots": ...
 
 
 class ForeignMemory:
     """Guest pages mapped into dom0, through libxenforeignmemory."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.lib = xen_library("xenforeignmemory")
-        self.handle = self.lib.xenforeignmemory_open(ffi.NULL, 0)
+        self.handle: CData = self.lib.xenforeignmemory_open(ffi.NULL, 0)
         if not self.handle:
             raise xen_error("xenforeignmemory_open")
 
-    def map(self, domid, gfns):
+    def map(self, domid: int, gfns: List[int]) -> CData:
         """Map the guest frames gfns (in this order), writable, and return the address of the first. Either every page
         is mapped, or none is and OSError is raised."""
         count = len(gfns)
@@ -404,7 +480,7 @@ class ForeignMemory:
         address = self.lib.xenforeignmemory_map(
             self.handle,
             domid,
-            mmap.PROT_READ | mmap.PROT_WRITE,
+            PROT_READ_WRITE,
             count,
             ffi.new("xen_pfn_t[]", gfns),
             errors,
@@ -421,10 +497,10 @@ class ForeignMemory:
                 )
         return address
 
-    def unmap(self, address, pages):
+    def unmap(self, address: CData, pages: int) -> None:
         self.lib.xenforeignmemory_unmap(self.handle, address, pages)
 
-    def map_ioreq(self, domid, server_id):
+    def map_ioreq(self, domid: int, server_id: int) -> Tuple[CData, "IoreqPage"]:
         """Map Xen's ioreq resource, which is not an ordinary guest GFN when the server is enabled."""
         address = ffi.new("void **")
         # memory.h: frame_ioreq(0) = 1 (frame 0 is the buffered ring). CFFI cannot declare function-like macros.
@@ -436,47 +512,55 @@ class ForeignMemory:
             1,
             1,
             address,
-            mmap.PROT_READ | mmap.PROT_WRITE,
+            PROT_READ_WRITE,
             0,
         )
         if not resource:
             raise xen_error("xenforeignmemory_map_resource")
-        return resource, ffi.cast("ioreq_t *", address[0])
+        return resource, cast("IoreqPage", ffi.cast("ioreq_t *", address[0]))
 
-    def unmap_ioreq(self, resource):
+    def unmap_ioreq(self, resource: CData) -> None:
         xen_check(
             self.lib.xenforeignmemory_unmap_resource(self.handle, resource),
             "xenforeignmemory_unmap_resource",
         )
 
-    def close(self):
+    def close(self) -> None:
         self.lib.xenforeignmemory_close(self.handle)
 
 
-def xen_error(operation):
+def xen_error(operation: str) -> OSError:
     error = ffi.errno
     return OSError(error, "%s: %s" % (operation, os.strerror(error)))
 
 
-def xen_check(result, operation):
+def xen_check(result: int, operation: str) -> int:
     if result < 0:
         raise xen_error(operation)
     return result
 
 
-def xen_library(name):
+def xen_library(name: str) -> CData:
     return ffi.dlopen("lib%s.so.1" % name)
 
 
 class IoreqServer:
     """A secondary emulator for one four-byte rendezvous register. It never acquires guest xenbus bindings."""
 
-    def __init__(self, domid, io_port, memory):
+    # Set once the constructor succeeds, and only used until close().
+    requests: "IoreqPage"
+    fd: int
+
+    def __init__(self, domid: int, io_port: int, memory: ForeignMemory) -> None:
         self.domid, self.io_port, self.memory = domid, io_port, memory
-        self.dm_handle = self.evt_handle = self.server_id = None
-        self.resource = self.requests = self.fd = None
+        # What close() releases, as far as the constructor got.
+        self.dm_handle: Optional[CData] = None
+        self.evt_handle: Optional[CData] = None
+        self.server_id: Optional[int] = None
+        self.resource: Optional[CData] = None
         self.enabled = False
-        self.ports = {}
+        # Our event channel ports, and the vCPU each is bound to.
+        self.ports: Dict[int, int] = {}
         self.next_bind_check = 0.0
         self.dm = xen_library("xendevicemodel")
         self.evt = xen_library("xenevtchn")
@@ -498,7 +582,7 @@ class IoreqServer:
                 "xendevicemodel_create_ioreq_server",
             )
             self.server_id = server_id[0]
-            self.resource, self.requests = memory.map_ioreq(self.domid, self.server_id)
+            self.resource, self.requests = memory.map_ioreq(self.domid, server_id[0])
             # Xen fills vp_eport only when enabled. Map the range last, once all response paths are ready.
             xen_check(
                 self.dm.xendevicemodel_set_ioreq_server_state(
@@ -520,7 +604,7 @@ class IoreqServer:
             raise
         log("listening on i/o port %#x (domain %s)" % (io_port, domid))
 
-    def refresh_ports(self):
+    def refresh_ports(self) -> None:
         """Bind Xen's per-vCPU endpoints, including vCPUs added after startup."""
         if time.monotonic() < self.next_bind_check:
             return
@@ -538,7 +622,7 @@ class IoreqServer:
                 )
                 self.ports[local] = cpu
 
-    def dispatch(self, cpu, link):
+    def dispatch(self, cpu: int, link: "GuestLink") -> None:
         """Complete even unsupported requests so a stray access cannot leave a vCPU blocked."""
         request = self.requests[cpu]
         if request.state != cdefs.STATE_IOREQ_READY:
@@ -564,7 +648,7 @@ class IoreqServer:
             # Aligned fields and x86 TSO: data is visible before the response state and notification.
             request.state = cdefs.STATE_IORESP_READY
 
-    def service(self, link):
+    def service(self, link: "GuestLink") -> None:
         # xenevtchn_pending may block even with O_NONBLOCK on some kernels. Always select before calling it.
         while select.select([self.fd], [], [], 0)[0]:
             local = xen_check(
@@ -586,7 +670,7 @@ class IoreqServer:
                     "xenevtchn_unmask",
                 )
 
-    def drain(self):
+    def drain(self) -> None:
         """After disabling new requests, wake vCPUs waiting for a response, including an interrupted notification."""
         self.next_bind_check = 0.0
         self.refresh_ports()
@@ -629,7 +713,7 @@ class IoreqServer:
                 return
             time.sleep(0.001)
 
-    def close(self):
+    def close(self) -> None:
         # Destroying a server frees its event channels; it isn't a substitute for notifying a blocked vCPU.
         # Disable first so no new requests race with the final responses, and retain the request page until done.
         if self.enabled:
@@ -659,7 +743,6 @@ class IoreqServer:
                 log("stopped ioreq server (domain %s)" % self.domid)
             self.server_id = None
             self.enabled = False
-        self.requests = None
         try:
             if self.resource is not None:
                 self.memory.unmap_ioreq(self.resource)
@@ -671,7 +754,6 @@ class IoreqServer:
             if self.dm_handle:
                 self.dm.xendevicemodel_close(self.dm_handle)
                 self.dm_handle = None
-            self.fd = None
 
 
 class RingError(Exception):
@@ -679,18 +761,19 @@ class RingError(Exception):
 
 
 class SharedRings:
-    """dom0's end of xenkd's rings (see xenkd/xenkd_shm.h). GuestLink owns the separate header and ring mappings;
+    """
+    dom0's end of xenkd's rings (see xenkd/xenkd_shm.h). GuestLink owns the separate header and ring mappings;
     these pointers are valid only until detach().
 
     x86 is TSO, so aligned 32-bit loads and stores done in program order are all the ordering needed. dom0's own
     indices are kept here, and only written to the header: the guest can't confuse us by changing them.
     """
 
-    def __init__(self, header, area, generation):
+    def __init__(self, header: "ShmHeader", area: "ShmSlots", generation: int) -> None:
         """Attach to a header that GuestLink.announce() has just checked (check_header())."""
-        self.expected_signature = cdefs.XENKD_SHM_SIGNATURE
-        self.tx_slots = cdefs.XENKD_SHM_TX_SLOTS
-        self.rx_slots = cdefs.XENKD_SHM_RX_SLOTS
+        self.expected_signature: int = cdefs.XENKD_SHM_SIGNATURE
+        self.tx_slots: int = cdefs.XENKD_SHM_TX_SLOTS
+        self.rx_slots: int = cdefs.XENKD_SHM_RX_SLOTS
         self.header = header
         self.tx = area
         # The RX slots follow the TX slots.
@@ -708,8 +791,10 @@ class SharedRings:
         header.Dom0Generation = generation
 
     @staticmethod
-    def check_header(header, generation):
-        """The complete signature fixes all geometry; generation identifies this initialization."""
+    def check_header(header: "ShmHeader", generation: int) -> None:
+        """
+        The complete signature fixes all geometry; generation identifies this initialization.
+        """
         signature, actual_generation = header.Signature, header.Generation
         if signature != cdefs.XENKD_SHM_SIGNATURE:
             raise RingError("unsupported shared area signature %08x" % signature)
@@ -718,9 +803,11 @@ class SharedRings:
                 "generation %x, not %x as announced" % (actual_generation, generation)
             )
 
-    def check(self):
-        """Make sure the guest still uses the area as announced: called before every batch of writes, to keep the
-        window in which we could write into pages Windows has reused as small as possible."""
+    def check(self) -> None:
+        """
+        Make sure the guest still uses the area as announced: called before every batch of writes, to keep the
+        window in which we could write into pages Windows has reused as small as possible.
+        """
         signature = self.header.Signature
         generation = self.header.Generation
         if signature != self.expected_signature or generation != self.generation:
@@ -729,18 +816,17 @@ class SharedRings:
                 % (signature, generation)
             )
 
-    def receive(self):
+    def receive(self) -> List[bytes]:
         """Heartbeat, and take the frames the guest sent."""
         self.check()
-        header = self.header
         self.beats = (self.beats + 1) & INDEX_MASK
-        header.Dom0Heartbeat = self.beats
-        prod = header.TxProd
+        self.header.Dom0Heartbeat = self.beats
+        prod = self.header.TxProd
         if prod == self.tx_cons:
             return []
         if (prod - self.tx_cons) & INDEX_MASK > self.tx_slots:
             raise RingError("bad TX producer %d (consumer %d)" % (prod, self.tx_cons))
-        frames = []
+        frames: List[bytes] = []
         while self.tx_cons != prod:
             slot = self.tx[self.tx_cons % self.tx_slots]
             length = slot.Length
@@ -750,16 +836,17 @@ class SharedRings:
             if length:
                 frames.append(bytes(ffi.buffer(slot.Data, length)))
             self.tx_cons = (self.tx_cons + 1) & INDEX_MASK
-        header.TxCons = self.tx_cons
+        self.header.TxCons = self.tx_cons
         return frames
 
-    def send(self, frame):
-        """Queue a frame for the guest. Returns False when the RX ring is full, so the caller drops the frame."""
+    def send(self, frame: bytes) -> bool:
+        """
+        Queue a frame for the guest. Returns False when the RX ring is full, so the caller drops the frame.
+        """
         if len(frame) > MAX_FRAME:
             raise ValueError("%d-byte frame" % len(frame))
         self.check()
-        header = self.header
-        cons = header.RxCons
+        cons = self.header.RxCons
         pending = (self.rx_prod - cons) & INDEX_MASK
         if pending > self.rx_slots:
             raise RingError("bad RX consumer %d (producer %d)" % (cons, self.rx_prod))
@@ -769,25 +856,26 @@ class SharedRings:
         ffi.memmove(slot.Data, frame, len(frame))
         slot.Length = len(frame)
         self.rx_prod = (self.rx_prod + 1) & INDEX_MASK
-        header.RxProd = self.rx_prod
+        self.header.RxProd = self.rx_prod
         return True
 
-    def detach(self):
-        """Tell the guest right away, if the area is still its, and stop using the mappings."""
+    def detach(self) -> None:
+        """
+        Tell the guest right away, if the area is still its. The caller then unmaps the area and drops this object.
+        """
         try:
             self.check()
             self.header.Dom0Generation = 0
         except RingError:
             pass
-        self.header = self.tx = self.rx = None
 
 
 class DropCounter:
-    def __init__(self, what):
+    def __init__(self, what: str) -> None:
         self.what = what
         self.count = 0
 
-    def drop(self):
+    def drop(self) -> None:
         self.count += 1
         if self.count == 1 or self.count % 100 == 0:
             log("%s, %d dropped so far" % (self.what, self.count))
@@ -796,23 +884,30 @@ class DropCounter:
 class GuestLink:
     """The guest's rings: attached by a PFN write, detached by all ones or when the area goes away."""
 
-    def __init__(self, memory, fast=False):
+    def __init__(self, memory: ForeignMemory, fast: bool = False) -> None:
         self.reply_spin = FAST_SPIN if fast else REPLY_SPIN
         self.burst_spin = FAST_SPIN if fast else BURST_SPIN
         self.memory = memory
-        self.domid = self.gfn = self.rings = self.mapping = self.error = None
+        # What the guest announced (IO_DETACH: nothing), and the rings and mappings while attached. Inside this class,
+        # attachment is tested as rings is not None, which type checkers understand, rather than with attached.
+        self.domid: Optional[int] = None
+        self.gfn = IO_DETACH
+        self.rings: Optional[SharedRings] = None
+        self.mapping: List[PageMapping] = []
+        # The last attachment failure, logged once.
+        self.error: Optional[str] = None
         # Until when to poll continuously: the guest is expected to send.
         self.spin_until = 0.0
         self.full = DropCounter("guest RX ring full")
         self.too_large = DropCounter("frame too large for the guest")
 
     @property
-    def attached(self):
+    def attached(self) -> bool:
         return self.rings is not None
 
-    def accepted_pfn(self, domid):
+    def accepted_pfn(self, domid: int) -> int:
         """Readback acknowledges an attached, still-valid header, not merely receipt of a port write."""
-        if self.attached and self.domid == domid:
+        if self.rings is not None and self.domid == domid:
             try:
                 self.rings.check()
                 return self.gfn
@@ -820,32 +915,32 @@ class GuestLink:
                 self.detach(str(e))
         return IO_DETACH
 
-    def announce(self, domid, gfn):
+    def announce(self, domid: int, gfn: int) -> None:
         if gfn == IO_DETACH:
             self.detach("the guest closed the rings")
             self.error = None
             return
-        if self.attached and self.domid == domid and self.gfn == gfn:
+        if self.rings is not None and self.domid == domid and self.gfn == gfn:
             try:
                 self.rings.check()
                 return
             except RingError as e:
                 self.detach(str(e))
 
-        mappings = []
+        mappings: List[PageMapping] = []
         ring_pages = cdefs.XENKD_SHM_RING_PAGES
         try:
             # Retain the header mapping; the PFN array contains only packet-ring pages.
             address = self.memory.map(domid, [gfn])
             mappings.append((address, 1))
-            shared_header = ffi.cast("XENKD_SHM_HEADER *", address)
+            shared_header = cast("ShmHeader", ffi.cast("XENKD_SHM_HEADER *", address))
             generation = shared_header.Generation
             SharedRings.check_header(shared_header, generation)
             gfns = list(shared_header.RingGfn)
             duplicates = len(set(gfns)) != len(gfns)
             if gfn in gfns or duplicates:
                 raise RingError("ring PFNs overlap each other or the header")
-            if self.attached:
+            if self.rings is not None:
                 self.detach("the guest announced generation %x" % generation)
             address = self.memory.map(domid, gfns)
             mappings.append((address, ring_pages))
@@ -854,9 +949,8 @@ class GuestLink:
             current_gfns = list(shared_header.RingGfn)
             if current_gfns != gfns:
                 raise RingError("the page list changed while mapping the shared area")
-            rings = SharedRings(
-                shared_header, ffi.cast("PXENKD_SHM_SLOT", address), generation
-            )
+            slots = cast("ShmSlots", ffi.cast("PXENKD_SHM_SLOT", address))
+            rings = SharedRings(shared_header, slots, generation)
         except (OSError, RingError) as e:
             self.unmap_all(mappings)
             # The guest announces every second until we attach, so say it once.
@@ -883,35 +977,36 @@ class GuestLink:
             )
         )
 
-    def detach(self, reason):
-        if not self.attached:
+    def detach(self, reason: str) -> None:
+        if self.rings is None:
             return
         self.rings.detach()
         self.unmap_all(self.mapping)
-        self.rings = self.mapping = None
+        self.rings = None
+        self.mapping = []
         log("detached from the shared area: %s" % reason)
 
-    def unmap_all(self, mappings):
+    def unmap_all(self, mappings: List[PageMapping]) -> None:
         """Unmap (address, pages) mappings, the latest first."""
         for address, pages in reversed(mappings):
             self.memory.unmap(address, pages)
 
-    def follow(self, domain):
+    def follow(self, domain: Domain) -> None:
         """Detach when the domain we're attached to goes away."""
-        if self.attached and domain.domid != self.domid:
+        if self.rings is not None and domain.domid != self.domid:
             self.detach("domain %s went away" % self.domid)
 
-    def timeout(self, limit):
+    def timeout(self, limit: float) -> float:
         """How long select() may wait before the rings need polling: at most limit."""
-        if not self.attached:
+        if self.rings is None:
             return limit
         if time.monotonic() < self.spin_until:
             return 0.0
         return min(limit, POLL_INTERVAL)
 
-    def poll(self):
+    def poll(self) -> List[bytes]:
         """Heartbeat, and return the frames from the guest."""
-        if not self.attached:
+        if self.rings is None:
             return []
         try:
             frames = self.rings.receive()
@@ -923,9 +1018,9 @@ class GuestLink:
             self.spin_until = time.monotonic() + self.burst_spin
         return frames
 
-    def send(self, frame):
+    def send(self, frame: bytes) -> None:
         """Pass a frame to the guest, or drop it if the guest can't take it now."""
-        if not self.attached:
+        if self.rings is None:
             return
         if len(frame) > MAX_FRAME:
             self.too_large.drop()
@@ -941,7 +1036,7 @@ class GuestLink:
             self.full.drop()
 
 
-def parse_io_port(text):
+def parse_io_port(text: str) -> int:
     try:
         port = int(text, 0)
     except ValueError:
@@ -953,19 +1048,19 @@ def parse_io_port(text):
     return port
 
 
-def parse_address(text):
+def parse_address(text: str) -> Address:
     host, separator, port = text.rpartition(":")
     if not separator or not host or not port.isdigit():
         raise argparse.ArgumentTypeError("expected HOST:PORT, got %r" % text)
     return host, int(port)
 
 
-def resolve_ipv4(host):
+def resolve_ipv4(host: str) -> bytes:
     """A host name or address, as an IPv4 address in network order. Raises OSError."""
     return socket.inet_aton(socket.gethostbyname(host))
 
 
-def checksum(data):
+def checksum(data: bytes) -> int:
     """The Internet checksum (RFC 1071) of data."""
     if len(data) % 2:
         data += b"\0"
@@ -985,11 +1080,15 @@ class UdpProxy:
     the rest again from its next ARP or UDP packet.
     """
 
-    def __init__(self, args):
+    # Set by open_socket(), before any traffic.
+    socket: socket.socket
+
+    def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.socket = None
         # The guest's end (MAC, IP, UDP port), learned from its frames unless given.
-        self.guest_mac = self.guest_ip = self.guest_port = None
+        self.guest_mac: Optional[bytes] = None
+        self.guest_ip: Optional[bytes] = None
+        self.guest_port: Optional[int] = None
         self.ip_id = 0
         self.dhcp_logged = False
         self.corrupted = DropCounter("damaged frame from the guest")
@@ -1018,10 +1117,10 @@ class UdpProxy:
             ip = resolve_ipv4(args.debugger[0])
         except OSError as e:
             raise SystemExit("bad debugger address %s: %s" % (args.debugger[0], e))
-        self.debugger = socket.inet_ntoa(ip), args.debugger[1]
+        self.debugger: Address = socket.inet_ntoa(ip), args.debugger[1]
         self.refused = DropCounter("the debugger isn't listening")
 
-    def open_socket(self):
+    def open_socket(self) -> None:
         """Talk to the debugger from a fixed port, so that a restarted bridge keeps its address. The socket is
         connected: the kernel drops datagrams from anyone else before they reach the bridge, or the guest."""
         debugger_ip, debugger_port = self.debugger
@@ -1044,7 +1143,7 @@ class UdpProxy:
             % (debugger_ip, debugger_port, port)
         )
 
-    def from_guest(self, frame):
+    def from_guest(self, frame: bytes) -> List[bytes]:
         """Handle a frame from the guest, and return the frames to send back to it."""
         ethertype = frame[12:14]
         if ethertype == ETHERTYPE_ARP and len(frame) >= 42:
@@ -1103,7 +1202,7 @@ class UdpProxy:
         return []
 
     @staticmethod
-    def check_udp(frame, header_length, length):
+    def check_udp(frame: bytes, header_length: int, length: int) -> Optional[str]:
         """Check a guest frame's IPv4 and UDP headers, and return what's wrong with it (or None)."""
         ip = frame[14 : 14 + header_length]
         total_length = struct.unpack("!H", ip[2:4])[0]
@@ -1121,7 +1220,7 @@ class UdpProxy:
                 return "bad UDP checksum"
         return None
 
-    def arp(self, frame):
+    def arp(self, frame: bytes) -> List[bytes]:
         operation = struct.unpack("!H", frame[20:22])[0]
         sender_mac, sender_ip, target_ip = frame[22:28], frame[28:32], frame[38:42]
         if operation != ARP_REQUEST:
@@ -1130,8 +1229,8 @@ class UdpProxy:
         # nobody else owns that address.
         if sender_ip == b"\0\0\0\0" or sender_ip == target_ip:
             return []
-        # Only the guest's KDNET address, asking for the debugger's, is answered, so that other hosts' ARP doesn't change
-        # where replies go.
+        # Only the guest's KDNET address, asking for the debugger's, is answered, so that other hosts' ARP doesn't
+        # change where replies go.
         if self.guest_ip is not None and sender_ip != self.guest_ip:
             return []
         if target_ip != self.host_ip:
@@ -1150,27 +1249,27 @@ class UdpProxy:
         )
         return [reply.ljust(60, b"\0")]
 
-    def from_debugger(self):
+    def from_debugger(self) -> List[bytes]:
         """Read the datagrams waiting from the debugger, and return them as frames for the guest. Reads at most what
         the guest's RX ring holds: the rest waits for the next call."""
-        frames = []
+        frames: List[bytes] = []
         for _ in range(cdefs.XENKD_SHM_RX_SLOTS):
             try:
                 payload = self.socket.recv(65535)
             except (BlockingIOError, ConnectionRefusedError):
                 break
-            if self.guest_mac is None or self.guest_ip is None:
-                if self.args.verbose:
-                    log(
-                        "dropping %d bytes from the debugger: no guest yet"
-                        % len(payload)
-                    )
-            else:
-                frames.append(self.frame_for_guest(payload))
+            frame = self.frame_for_guest(payload)
+            if frame is not None:
+                frames.append(frame)
+            elif self.args.verbose:
+                log("dropping %d bytes from the debugger: no guest yet" % len(payload))
         return frames
 
-    def frame_for_guest(self, payload):
-        """Wrap a datagram from the debugger in the frame the guest would get if the debugger sent it directly."""
+    def frame_for_guest(self, payload: bytes) -> Optional[bytes]:
+        """Wrap a datagram from the debugger in the frame the guest would get if the debugger sent it directly, or
+        return None while the guest's addresses are unknown."""
+        if self.guest_mac is None or self.guest_ip is None:
+            return None
         # KDNET uses the same port on both ends, so that's the best guess until the guest says otherwise.
         guest_port = self.guest_port or self.host_port
         length = 8 + len(payload)
@@ -1204,20 +1303,24 @@ class UdpProxy:
 class Bridge:
     """The domain followed, its rendezvous and rings, and the debugger's socket, tied together."""
 
-    def __init__(self, args):
+    def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.key = follow_key()
         self.domain = Domain(self.key, resolve_domain(args.domain, self.key))
         self.proxy = UdpProxy(args)
+        # Should the rest fail, the socket closes as the process exits: nothing of it outlives the bridge.
+        self.proxy.open_socket()
         # Last: from here on, close() must run. Shared by the rings and the ioreq server, so closed after both.
         try:
             self.memory = ForeignMemory()
         except OSError as e:
             raise SystemExit("cannot map guest memory: %s" % e)
         self.link = GuestLink(self.memory, fast=args.fast)
-        self.server = self.error = None
+        self.server: Optional[IoreqServer] = None
+        # The last failure to create the server, logged once.
+        self.error: Optional[str] = None
 
-    def follow_domain(self):
+    def follow_domain(self) -> None:
         """Catch up with the domain: detach from a domain that went away, and serve the rendezvous of the current one.
         Returns right away until a check is due, so it doesn't slow spinning down."""
         changed = self.domain.poll()
@@ -1251,9 +1354,9 @@ class Bridge:
         if self.server is not None:
             self.server.refresh_ports()
 
-    def serve(self):
+    def serve(self) -> None:
         """Wait for the debugger, an I/O request or the next poll (no wait while spinning), and pass frames along."""
-        readers = [self.proxy.socket]
+        readers: List[Union[int, socket.socket]] = [self.proxy.socket]
         if self.server is not None:
             readers.append(self.server.fd)
         timeout = self.link.timeout(self.domain.time_to_poll())
@@ -1262,7 +1365,7 @@ class Bridge:
             try:
                 self.server.service(self.link)
             except OSError:
-                if read_domain(self.domain.domid, self.key) == self.domain.value:
+                if read_domain(self.server.domid, self.key) == self.domain.value:
                     raise
                 # The target vanished while a response was being sent. follow_domain() detaches, closes the server and
                 # creates one for the domain's next domid.
@@ -1277,29 +1380,27 @@ class Bridge:
             for frame in self.proxy.from_debugger():
                 self.send_to_guest(frame)
 
-    def send_to_guest(self, frame):
+    def send_to_guest(self, frame: bytes) -> None:
         if not self.link.attached:
             return
         if self.args.verbose:
             log("proxy > guest: %s" % describe_frame(frame))
         self.link.send(frame)
 
-    def close(self):
+    def close(self) -> None:
         # Every step runs even if an earlier one fails, last registered first: release the shared rings, then the ioreq
         # server (whose close() completes any outstanding shutdown OUT), then the memory both used, then the socket.
         with contextlib.ExitStack() as stack:
-            if self.proxy.socket is not None:
-                stack.callback(self.proxy.socket.close)
+            stack.callback(self.proxy.socket.close)
             stack.callback(self.memory.close)
             if self.server is not None:
                 stack.callback(self.server.close)
             stack.callback(self.link.detach, "the bridge is exiting")
 
 
-def run(args, stopping):
+def run(args: argparse.Namespace, stopping: Callable[[], bool]) -> None:
     bridge = Bridge(args)
     try:
-        bridge.proxy.open_socket()
         while not stopping():
             bridge.follow_domain()
             bridge.serve()
@@ -1307,9 +1408,9 @@ def run(args, stopping):
         bridge.close()
 
 
-def main():
-    # The docstring's first paragraph comes before the options in --help, the rest after.
-    summary, details = __doc__.split("\n\n", 1)
+def main() -> None:
+    # The docstring's first paragraph comes before the options in --help, the rest after. python -OO strips it.
+    summary, _, details = (__doc__ or "").partition("\n\n")
     parser = argparse.ArgumentParser(
         description=summary,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1375,15 +1476,16 @@ def main():
 
     stop_requested = False
 
-    def request_stop(signum, frame):
+    def request_stop(signum: int, frame: object) -> None:
         nonlocal stop_requested
         # Don't raise inside an ioreq update, mapping operation or cleanup. Finish the current operation first.
         stop_requested = True
 
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
-    # Losing the terminal would otherwise kill the bridge without cleanup. Windows, where the tests also run, has none.
-    if hasattr(signal, "SIGHUP"):
+    # Losing the terminal would otherwise kill the bridge without cleanup. Windows, where the tests also run, has no
+    # SIGHUP; type checkers understand this test, unlike hasattr().
+    if sys.platform != "win32":
         signal.signal(signal.SIGHUP, request_stop)
     # With SIGINT handled above, Ctrl+C sets the flag instead of raising KeyboardInterrupt.
     try:
