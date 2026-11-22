@@ -1041,17 +1041,17 @@ class UdpProxy:
         """Talk to the debugger from a fixed port, so that a restarted bridge keeps its address. The socket is
         connected: the kernel drops datagrams from anyone else before they reach the bridge, or the guest."""
         port = self.args.local_port or self.debugger[1]
+        # No SO_REUSEADDR: UDP has no TIME_WAIT, so a restarted bridge rebinds right away without it, and with it a
+        # second bridge (or any other socket that sets it) could bind the same port and get the debugger's datagrams.
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Rebind right away after a restart, so the debugger keeps seeing the target at the same address.
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             self.socket.bind(("0.0.0.0", port))
             self.socket.connect(self.debugger)
         except OSError as e:
             raise SystemExit(
-                "cannot talk to the debugger at %s:%d from udp port %d: %s (if the"
-                " debugger runs in dom0, pick another port with --local-port)"
-                % (self.debugger + (port, e))
+                "cannot talk to the debugger at %s:%d from udp port %d: %s (if another"
+                " bridge or the debugger uses that port in dom0, pick another one with"
+                " --local-port)" % (self.debugger + (port, e))
             )
         self.socket.setblocking(False)
         log(

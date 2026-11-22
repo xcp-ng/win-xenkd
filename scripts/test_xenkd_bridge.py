@@ -1247,6 +1247,8 @@ class FilterTest(unittest.TestCase):
         # From the debugger's port (no --local-port), and connected, so that the kernel drops anyone else's datagrams.
         connection.bind.assert_called_once_with(("0.0.0.0", 50000))
         connection.connect.assert_called_once_with(("192.0.2.7", 50000))
+        # Not shared: no SO_REUSEADDR, so a second bridge on the same port fails instead of taking datagrams.
+        connection.setsockopt.assert_not_called()
         order = [call[0] for call in connection.mock_calls]
         self.assertLess(order.index("bind"), order.index("connect"))
 
