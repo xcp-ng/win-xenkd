@@ -1,55 +1,45 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Detects the xenkd debug device and enables kernel debugging through it.
+    Enables kernel debugging through the xenkd device.
 
 .DESCRIPTION
-    Finds the Xen debug PCI device (5853:c201), installs the matching xenkd DLL (kd_<class>_5853.dll) from the current
-    directory into System32 if it's there (otherwise it must already be installed), and configures the boot debug
-    settings to use the device. The PV console is not needed.
+    Finds the xenkd PCI device (5853:c201), installs its DLL (kd_<class>_5853.dll) from the current directory into
+    System32 if it's there (otherwise it must already be installed), and points the kernel debugger at the device.
     Takes effect after a reboot.
 
 .PARAMETER HostIp
-    Debugger host IP for "bcdedit /dbgsettings net". KDNET requires network debug settings to load extension modules.
-    This is only the debugger's address on the private network between the guest and the dom0 bridge, and must match
-    the bridge's --destination. Where the debugger really runs is given to the bridge. bcdedit rejects 0.0.0.0, so the
-    default is a link-local placeholder.
+    The debugger's address as the guest sees it, on the private network it shares with the dom0 bridge: the bridge's
+    --destination. Where the debugger really runs is given to the bridge.
 
 .PARAMETER Port
-    Debugger port for "bcdedit /dbgsettings net". Like HostIp, only the debugger's port on the private network: it must
-    match the bridge's --destination, not WinDbg's port.
+    The debugger's port as the guest sees it: the bridge's --destination, not WinDbg's port.
 
 .PARAMETER Key
-    Debugger key. If omitted, bcdedit generates one and prints it.
+    KDNET encryption key. If omitted, bcdedit generates one and prints it.
 
 .PARAMETER BootDebug
-    Also enable boot debugging (bootmgr/winload) over a serial port, keeping the kernel on xenkd. The shared
-    {dbgsettings} become serial and the kernel is pointed at KDNET through winload's kernel-only BCD elements
-    (dbgtransport, and 0x2200012D for busparams), which the boot debugger ignores.
+    Also debug bootmgr and winload, over a serial port. The kernel still goes through xenkd.
 
 .PARAMETER ComPort
-    With -BootDebug, the COM port used for boot debugging.
+    With -BootDebug, the serial port for boot debugging.
 
 .PARAMETER BaudRate
-    With -BootDebug, the baud rate of the boot debugging serial port.
+    With -BootDebug, the serial port's baud rate.
 
 .PARAMETER TargetIp
-    The guest's own address on the debug network (TARGET_IP, with NO_DHCP). xenkd-bridge.py is a fake network that
-    doesn't answer DHCP, and a fixed address lets a restarted bridge reach the guest before it says anything (pass the
-    same one to its --guest-ip).
+    The guest's address on the private network: the bridge's --guest-ip. Fixed, since the bridge doesn't answer DHCP.
 
 .PARAMETER IoPort
-    Rendezvous I/O port, default 0xEC. Sets XENKD_IOPORT in the load options; pass the same value to the bridge's
-    --io-port. All four bytes must be reserved in guest ACPI and unused by other virtual hardware.
+    Rendezvous I/O port: the bridge's --io-port. All four bytes must be reserved in guest ACPI and unused by other
+    virtual hardware.
 
 .PARAMETER Clear
-    Instead of enabling anything, turn kernel and boot debugging off and remove every debug setting this script
-    makes from the BCD. The xenkd DLL, test signing, the xenbus registry settings and the xencons device are left alone.
+    Turn debugging off and remove the BCD settings this script makes. Nothing else is changed.
 
 .PARAMETER ClearAll
-    Like -Clear, and also undo everything else the script does: delete the xenkd DLL from System32, and give xencons
-    and xenbus the default console back. xenbus's ConsoleLogLevel can't be restored, since the script deleted it
-    without keeping the old value.
+    Like -Clear, and also delete the xenkd DLL, and give xencons and xenbus back the default console that older
+    versions of this script took (xenbus's ConsoleLogLevel can't be restored).
 
 .EXAMPLE
     .\Enable-XenKd.ps1 -WhatIf
@@ -68,6 +58,8 @@
 #>
 [CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'Kernel')]
 param(
+    # The default addresses are link-local, since the network is a private link, and in 169.254.0.0/24, which
+    # automatic addressing never assigns (RFC 3927): Windows can't give itself either of them.
     [string]$HostIp = '169.254.0.1',
     [ValidateRange(1, 65535)]
     [int]$Port = 5364,
@@ -129,8 +121,7 @@ function Get-BcdValue {
     ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() }
 }
 
-# Rewrite the loadoptions of the OS loader entry: drop the words matching $Remove, then append $Add. /set replaces the
-# whole value, so anything else that's there is kept.
+# Drop the words matching $Remove from the loader's loadoptions and append $Add, keeping everything else.
 function Update-LoadOptions {
     [CmdletBinding(SupportsShouldProcess)]
     param([string[]]$Remove, [string[]]$Add)
@@ -152,16 +143,16 @@ function Update-LoadOptions {
     }
 }
 
-# winload's kernel-only debugger elements: they take precedence over {dbgsettings} for the kernel, while the boot
-# debugger only reads {dbgsettings}.
+# winload's kernel-only busparams element, which bcdedit has no name for. Like dbgtransport, the kernel prefers it to
+# {dbgsettings}, which is all the boot debugger reads: -BootDebug uses both to keep the kernel on xenkd.
 $KernelBusParams = 'custom:2200012D'
 
 # With viridian, Xen looks like Hyper-V to winload, which then replaces the net debug device with the Hyper-V synthetic
 # one and ignores busparams, unless the load options carry this flag.
 $HvFlag = 'FORCEHVTONOTSHAREDEBUGDEVICE'
 
-# KDNET's own settings, which it parses from the load options. winload only generates them when {dbgsettings} is net, so
-# with -BootDebug they're added to loadoptions instead. Without ENCRYPTION_KEY, KDNET fails with bugcheck 0x7E.
+# KDNET's settings, which it reads from the load options. winload only adds them when {dbgsettings} is net, so
+# -BootDebug adds them itself. Without ENCRYPTION_KEY, KDNET bugchecks (0x7E).
 $KdNetOptions = @('HOST_IP=\S*', 'HOST_PORT=\S*', 'ENCRYPTION_KEY=\S*', 'TARGET_IP=\S*', 'NO_DHCP')
 $XenKdOptions = @('XENKD_IOPORT=\S*')
 
@@ -251,8 +242,8 @@ if ($Key) {
     $netArgs += "key:$Key"
 }
 Invoke-Bcdedit $netArgs
-# KDNET parses TARGET_IP and NO_DHCP from the load options itself, so they work whether or not winload generates the
-# rest. It keeps a TARGET_IP outside 169.254/16 only with an encryption key, which there always is here.
+# KDNET reads TARGET_IP and NO_DHCP from the load options in both modes. (It only accepts a TARGET_IP outside
+# 169.254/16 with an encryption key, which there always is.)
 $loadOptionsToAdd = @($HvFlag, "TARGET_IP=$TargetIp", 'NO_DHCP', ('XENKD_IOPORT=0x{0:X}' -f $IoPort))
 if ($BootDebug) {
     # Read the key back, since bcdedit generates one if -Key wasn't given.
@@ -265,9 +256,8 @@ if ($BootDebug) {
     }
     $loadOptionsToAdd += "HOST_IP=$HostIp", "HOST_PORT=$Port", "ENCRYPTION_KEY=$netKey"
 
-    # Switch only the shared transport to serial with /set: /dbgsettings serial would drop the net settings above,
-    # which KDNET still reads once the kernel picks it. busparams moves to the kernel-only element, or the serial boot
-    # debugger would take it as the location of its UART.
+    # Only switch the transport to serial: /dbgsettings serial would drop the net settings, which KDNET still reads.
+    # busparams moves to the kernel-only element, or the boot debugger would take it for its UART's location.
     Invoke-Bcdedit @('/set', '{dbgsettings}', 'debugtype', 'serial')
     Invoke-Bcdedit @('/set', '{dbgsettings}', 'debugport', "$ComPort")
     Invoke-Bcdedit @('/set', '{dbgsettings}', 'baudrate', "$BaudRate")
@@ -284,8 +274,7 @@ else {
     Invoke-Bcdedit @('/set', '{dbgsettings}', 'busparams', $busParams)
 }
 
-# Keep winload from swapping in the Hyper-V synthetic debug device ($HvFlag), and with -BootDebug pass KDNET its net
-# settings and address. Stale KDNET options from an earlier run are replaced (or dropped when no longer wanted).
+# Replace whatever load options an earlier run left.
 Update-LoadOptions -Remove (@($HvFlag) + $KdNetOptions + $XenKdOptions) -Add $loadOptionsToAdd
 
 Invoke-Bcdedit @('/debug', 'on')

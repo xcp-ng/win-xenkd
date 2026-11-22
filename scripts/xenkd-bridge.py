@@ -1,26 +1,15 @@
 #!/usr/bin/env python3
 """Bridge a guest's xenkd to the debugger, over UDP from dom0.
 
-xenkd gives KDNET a network card made of two rings of Ethernet frames in guest memory (see xenkd/xenkd_shm.h), and
-announces their header PFN with a 32-bit I/O write. The bridge maps the rings from dom0, polls them, and stands in for
-KDNET's network: it answers the guest's ARP, forwards its UDP payloads to the debugger from an ordinary UDP socket, and
-wraps the debugger's replies back into frames. The debugger only needs to reach dom0 on one UDP port. Where it runs
-is given on the command line; the guest's HOST_IP:port (--destination) is only its address on the bridge's private
-network. DHCP isn't answered, so the guest needs NO_DHCP and TARGET_IP (as Enable-XenKd.ps1 sets them). Attach with
-`windbg -k net:port=<port>,key=<key>`, the port being the debugger's.
+xenkd gives KDNET a network card made of two rings of Ethernet frames in guest memory (see xenkd/xenkd_shm.h). The
+bridge maps the rings and is the network on the other end: it answers the guest's ARP, and carries KDNET's UDP between
+the guest and the debugger. The guest sees the debugger at --destination, on a private network; where the debugger
+really runs is the second argument. Attach with `windbg -k net:port=<port>,key=<key>`, using that argument's port.
 
-The bridge can be restarted during a debug session: it talks to the debugger from a fixed port, knows the guest's
-address right away (its MAC follows from the domain's UUID, its IP is --guest-ip if given), and xenkd announces its
-rings again within about 3 s of the bridge going away.
-
-It follows the guest across reboots, which change its domid: by its UUID on XAPI hosts (XenServer, XCP-ng), where names
-can repeat, and by its name with xl, where `xl create` gives a new UUID unless the config sets one. A domid, or the
-other of the two, is looked up from the running domain at startup.
+The bridge follows the domain across reboots, and can be restarted without losing the debug session.
 
 Run in dom0 as root. Needs CFFI 1.9.1 or later, xenstore-read, xenstore-list, libxenforeignmemory, libxendevicemodel
-and libxenevtchn. The Xen libraries are loaded in ABI mode; no compiler or headers are needed at runtime.
-The I/O port defaults to 0xec; --io-port and the guest's XENKD_IOPORT load option must agree. Its four bytes must be
-reserved in guest ACPI and unused by other virtual hardware. The PV console is left alone.
+and libxenevtchn.
 """
 
 import argparse
@@ -81,7 +70,9 @@ ARP_REQUEST = 1
 ARP_REPLY = 2
 # What the guest sees as the MAC of every other host (locally administered).
 PROXY_MAC = b"\x02\x00\x00\x6b\x64\x00"
-# Where Enable-XenKd.ps1 points KDNET (-HostIp and -Port) unless told otherwise.
+# The debugger's address as the guest sees it, as Enable-XenKd.ps1 sets it by default (-HostIp and -Port). Link-local,
+# since the network between the guest and the bridge is a private link, and in 169.254.0.0/24, which automatic
+# addressing never assigns (RFC 3927): Windows can't give itself this address.
 DEFAULT_DESTINATION = "169.254.0.1:5364"
 
 
