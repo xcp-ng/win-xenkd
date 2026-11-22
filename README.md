@@ -185,7 +185,7 @@ before enabling the new DLL if you want to restore the PV console. It cannot rec
   byte layout and check sizes and field offsets. Shared-memory code accesses fields by name and reads constants
   from CFFI's library namespace rather than defining separate Python values.
 - The bridge's `IOREQ_CDEF` mirrors the constants and request structure in `include/xen/hvm/ioreq.h`, including its
-  bitfields. Tests compare that block when the Xen header is present and independently check its byte layout.
+  bitfields. Tests check its byte layout against Xen's wire format.
 
 ## Limitations
 
