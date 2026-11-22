@@ -48,12 +48,19 @@ DOMAIN_CHECK_INTERVAL = 2.0
 UUID_FORMAT = re.compile(r"^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$", re.IGNORECASE)
 # Only XAPI hosts (XenServer, XCP-ng) have it.
 XAPI_INVENTORY = "/etc/xensource-inventory"
-# While attached, how often to poll the rings: every ACTIVE_POLL_INTERVAL (continuously with --fast) for ACTIVE_PERIOD
-# after the last frame in either direction, then slower.
+# While attached, how often to poll the rings: every ACTIVE_POLL_INTERVAL for ACTIVE_PERIOD after the last frame in
+# either direction, then every IDLE_POLL_INTERVAL.
 ACTIVE_POLL_INTERVAL = 0.0002
 IDLE_POLL_INTERVAL = 0.005
 ACTIVE_PERIOD = 1.0
-# With --fast, how often to check I/O notifications and timeouts again while spinning.
+# While the guest is expected to send, poll continuously instead: for up to GUEST_REPLY_SPIN after passing it a frame,
+# and GUEST_BURST_SPIN after each frame from it. KDNET answers a request within tens of microseconds, with a burst of
+# frames about 10 us apart; the debugger takes over 100 us to answer, during which the bridge waits on its socket.
+# With --fast, it keeps polling continuously while frames flow, which saves waking up for each of the debugger's
+# answers.
+GUEST_REPLY_SPIN = 0.0002
+GUEST_BURST_SPIN = 0.00005
+# While spinning, how often to check I/O notifications and timeouts again.
 SPIN_SLICE = 0.001
 
 # Xen uses 4 KiB pages; shared-memory geometry and signature come from the CFFI declarations below.
@@ -780,14 +787,16 @@ class DropCounter:
 class GuestLink:
     """The guest's rings: attached by a PFN write, detached by all ones or when the area goes away."""
 
-    def __init__(self, args, memory=None):
-        self.args = args
+    def __init__(self, memory=None, fast=False):
+        self.fast = fast
         try:
             self.memory = memory or ForeignMemory()
         except OSError as e:
             raise SystemExit("cannot map guest memory: %s" % e)
         self.domid = self.gfn = self.rings = self.mapping = self.error = None
         self.last_traffic = 0.0
+        # Until when the guest is expected to send.
+        self.spin_until = 0.0
         self.full = DropCounter("guest RX ring full")
         self.too_large = DropCounter("frame too large for the guest")
 
@@ -891,12 +900,20 @@ class GuestLink:
         """Whether frames flowed in either direction within ACTIVE_PERIOD."""
         return self.attached and time.monotonic() - self.last_traffic < ACTIVE_PERIOD
 
+    def spinning(self):
+        """Whether to poll continuously: the guest is expected to send soon, so waiting for the next poll would delay
+        a round trip, or frames flow with --fast."""
+        if not self.attached:
+            return False
+        return time.monotonic() < self.spin_until or (self.fast and self.busy())
+
     def timeout(self, limit):
         """How long select() may wait before the rings need polling: at most limit, unless busy (when the domain check
         that limit is for waits)."""
+        if self.spinning():
+            return 0.0
         if self.busy():
-            # KDNET waits for the answer to most packets, so any wait for the next poll adds to every round trip.
-            return 0.0 if self.args.fast else ACTIVE_POLL_INTERVAL
+            return ACTIVE_POLL_INTERVAL
         return min(limit, IDLE_POLL_INTERVAL) if self.attached else limit
 
     def poll(self):
@@ -909,7 +926,9 @@ class GuestLink:
             self.detach(str(e))
             return []
         if frames:
+            # The guest answered: what's left to wait for is the rest of its burst.
             self.last_traffic = time.monotonic()
+            self.spin_until = self.last_traffic + GUEST_BURST_SPIN
         return frames
 
     def send(self, frame):
@@ -926,6 +945,7 @@ class GuestLink:
             return
         if sent:
             self.last_traffic = time.monotonic()
+            self.spin_until = max(self.spin_until, self.last_traffic + GUEST_REPLY_SPIN)
         else:
             self.full.drop()
 
@@ -1202,7 +1222,7 @@ class UdpProxy:
 def run(args, stopping):
     key = follow_key()
     domain = Domain(key, resolve_domain(args.domain, key))
-    link = GuestLink(args)
+    link = GuestLink(fast=args.fast)
     server = proxy = None
     error = None
 
@@ -1250,8 +1270,10 @@ def run(args, stopping):
                 for fd in (proxy.socket, server.fd if server else None)
                 if fd is not None
             ]
+            # Wait for the debugger, an I/O request or the next poll. While the guest is expected to send, spin in this
+            # loop instead, coming back for the housekeeping above at least every SPIN_SLICE.
             timeout = link.timeout(domain.time_to_poll())
-            spin_until = time.monotonic() + SPIN_SLICE if timeout == 0 else 0.0
+            slice_end = time.monotonic() + SPIN_SLICE
             while not stopping():
                 readable = select.select(readers, [], [], timeout)[0]
                 config_read = server is not None and server.fd in readable
@@ -1276,8 +1298,9 @@ def run(args, stopping):
                 if proxy.socket in readable:
                     for frame in proxy.from_debugger():
                         send_to_guest(frame)
-                if config_read or time.monotonic() >= spin_until:
+                if config_read or not link.spinning() or time.monotonic() >= slice_end:
                     break
+                timeout = 0.0
     finally:
         # Release the shared rings before close() completes any outstanding shutdown OUT.
         try:
@@ -1344,9 +1367,10 @@ def main():
     parser.add_argument(
         "--fast",
         action="store_true",
-        help="while frames flow, poll the guest's rings continuously instead of every"
-        " %d us: about 1.5 times the throughput, but keeps a dom0 CPU busy until"
-        " %g s after the last frame" % (ACTIVE_POLL_INTERVAL * 1e6, ACTIVE_PERIOD),
+        help="while frames flow, poll the guest's rings continuously, not only while"
+        " the guest is expected to send: memory dumps 15 (PyPy) to 35 (CPython) percent"
+        " faster, but keeps a dom0 CPU busy until %g s after the last frame"
+        % ACTIVE_PERIOD,
     )
     parser.add_argument(
         "-v",

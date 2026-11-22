@@ -249,9 +249,7 @@ class SharedRingsTest(unittest.TestCase):
     def setUp(self):
         self.guest = FakeGuest()
         self.memory = FakeMemory(self.guest)
-        self.link = bridge.GuestLink(
-            types.SimpleNamespace(verbose=False, fast=False), self.memory
-        )
+        self.link = bridge.GuestLink(self.memory)
 
     def attach(self):
         self.link.announce(DOMID, self.guest.announce())
@@ -277,23 +275,53 @@ class SharedRingsTest(unittest.TestCase):
         self.assertFalse(self.link.busy())
         self.assertEqual(self.link.timeout(1.0), 1.0)
         self.attach()
-        # Fast while frames flow, spinning with --fast. The domain check waits, so its overdue deadline doesn't count.
+        # Fast while frames flow. The domain check waits, so its overdue deadline doesn't count.
         self.assertTrue(self.link.busy())
+        self.assertFalse(self.link.spinning())
         self.assertEqual(self.link.timeout(0.0), bridge.ACTIVE_POLL_INTERVAL)
-        self.link.args.fast = True
-        self.assertEqual(self.link.timeout(1.0), 0.0)
         # Slower once they stop.
         self.link.last_traffic -= bridge.ACTIVE_PERIOD
         self.assertFalse(self.link.busy())
         self.assertEqual(self.link.timeout(1.0), bridge.IDLE_POLL_INTERVAL)
-        self.link.args.fast = False
-        self.assertEqual(self.link.timeout(1.0), bridge.IDLE_POLL_INTERVAL)
         self.assertEqual(self.link.timeout(0.001), 0.001)
-        # A frame makes polling fast again.
+        # A frame makes polling fast again (or continuous, for a moment: see test_spinning).
         self.guest.send(frame(1))
         self.link.poll()
         self.assertTrue(self.link.busy())
-        self.assertEqual(self.link.timeout(1.0), bridge.ACTIVE_POLL_INTERVAL)
+        self.assertLessEqual(self.link.timeout(1.0), bridge.ACTIVE_POLL_INTERVAL)
+
+    def test_spinning(self):
+        self.attach()
+        now = [100.0]
+        with mock.patch.object(bridge.time, "monotonic", lambda: now[0]):
+            # While the guest is expected to answer a frame passed to it...
+            self.link.send(frame(1))
+            self.assertEqual(self.link.timeout(1.0), 0.0)
+            now[0] += bridge.GUEST_REPLY_SPIN
+            self.assertFalse(self.link.spinning())
+            self.assertEqual(self.link.timeout(1.0), bridge.ACTIVE_POLL_INTERVAL)
+            # ...and once it answers, only for the rest of its burst.
+            self.link.send(frame(2))
+            self.guest.send(frame(3))
+            self.assertEqual(self.link.poll(), [frame(3)])
+            self.assertTrue(self.link.spinning())
+            now[0] += bridge.GUEST_BURST_SPIN
+            self.assertFalse(self.link.spinning())
+            # Never while detached.
+            self.link.send(frame(4))
+            self.link.detach("the test is over")
+            self.assertFalse(self.link.spinning())
+
+    def test_fast_spins_while_frames_flow(self):
+        self.link = bridge.GuestLink(self.memory, fast=True)
+        self.assertFalse(self.link.spinning())
+        self.attach()
+        self.assertTrue(self.link.spinning())
+        self.assertEqual(self.link.timeout(1.0), 0.0)
+        # Not once frames stop.
+        self.link.last_traffic -= bridge.ACTIVE_PERIOD
+        self.assertFalse(self.link.spinning())
+        self.assertEqual(self.link.timeout(1.0), bridge.IDLE_POLL_INTERVAL)
 
     def test_empty_slots(self):
         # Frames of length 0 are skipped, but still consumed.
@@ -717,9 +745,7 @@ class IoreqTest(unittest.TestCase):
     def setUp(self):
         self.guest = FakeGuest()
         self.memory = FakeMemory(self.guest)
-        self.link = bridge.GuestLink(
-            types.SimpleNamespace(verbose=False, fast=False), self.memory
-        )
+        self.link = bridge.GuestLink(self.memory)
         self.dm = mock.Mock()
         self.evt = mock.Mock()
         self.dm.xendevicemodel_open.return_value = 1
