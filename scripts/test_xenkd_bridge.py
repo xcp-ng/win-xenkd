@@ -162,10 +162,7 @@ class FakeMemory:
         address = bridge.ffi.cast("void *", self.guest.cdata + first * PAGE_SIZE)
         # Two retained header maps can refer to the same fake address during a generation change.
         self.mappings[id(address)] = count
-        view = memoryview(self.guest.memory)[
-            first * PAGE_SIZE : (first + count) * PAGE_SIZE
-        ]
-        return address, view
+        return address
 
     def unmap(self, address, pages):
         assert self.mappings.pop(id(address)) == pages
@@ -414,26 +411,6 @@ class SharedRingsTest(unittest.TestCase):
         self.assertEqual(self.memory.mapped, 0)
         self.assertEqual(self.memory.unmap_calls, [1])
 
-    def test_short_mapping_rejected_before_pointer_access(self):
-        original = self.memory.map
-        for pages in (1, PAGES - 1):
-            with self.subTest(pages=pages):
-                self.guest.initialize(0x1234)
-
-                def short_map(domid, gfns):
-                    address, view = original(domid, gfns)
-                    if len(gfns) == pages:
-                        short = view[:-1]
-                        view.release()
-                        return address, short
-                    return address, view
-
-                with mock.patch.object(self.memory, "map", side_effect=short_map):
-                    self.link.announce(DOMID, self.guest.announce())
-                self.assertFalse(self.link.attached)
-                self.assertFalse(self.guest.attached)
-                self.assertEqual(self.memory.mapped, 0)
-
     def test_header_changes_during_ring_map(self):
         original = self.memory.map
         for field in ("signature", "generation", "pfns"):
@@ -597,7 +574,7 @@ class ForeignMemoryTest(unittest.TestCase):
         self.memory = bridge.ForeignMemory()
         self.addCleanup(self.memory.close)
 
-    def test_mapping_is_writable_without_copying(self):
+    def test_mapping_returns_the_mapped_address(self):
         raw = bridge.ffi.new("unsigned char[]", 2 * PAGE_SIZE)
         gfns = [BASE_GFN + 4, BASE_GFN + 19]
 
@@ -609,16 +586,9 @@ class ForeignMemoryTest(unittest.TestCase):
             return raw
 
         self.lib.xenforeignmemory_map.side_effect = map_pages
-        address, view = self.memory.map(DOMID, gfns)
-        words = view.cast("I")
-        words[PAGE_SIZE // 4] = 0x12345678
-        self.assertEqual(
-            bytes(bridge.ffi.buffer(raw + PAGE_SIZE, 4)), b"\x78\x56\x34\x12"
-        )
-        raw[0] = 0xA5
-        self.assertEqual(view[0], 0xA5)
-        words.release()
-        view.release()
+        address = self.memory.map(DOMID, gfns)
+        # Used in place: nothing is copied out of the mapping.
+        self.assertIs(address, raw)
         self.memory.unmap(address, 2)
         self.lib.xenforeignmemory_unmap.assert_called_once_with(self.handle, raw, 2)
 

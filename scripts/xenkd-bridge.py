@@ -381,8 +381,8 @@ class ForeignMemory:
             raise xen_error("xenforeignmemory_open")
 
     def map(self, domid, gfns):
-        """Map the guest frames gfns (in this order), writable, and return (address, memoryview). The view is invalid
-        once unmap() is called with the address."""
+        """Map the guest frames gfns (in this order), writable, and return the address of the first. Either every page
+        is mapped, or none is and OSError is raised."""
         count = len(gfns)
         errors = ffi.new("int[]", count)
         address = self.lib.xenforeignmemory_map(
@@ -403,7 +403,7 @@ class ForeignMemory:
                 raise OSError(
                     error, "cannot map gfn %x: %s" % (gfn, os.strerror(error))
                 )
-        return address, memoryview(ffi.buffer(address, count * PAGE_SIZE))
+        return address
 
     def unmap(self, address, pages):
         self.lib.xenforeignmemory_unmap(self.handle, address, pages)
@@ -822,10 +822,8 @@ class GuestLink:
         ring_pages = cdefs.XENKD_SHM_RING_PAGES
         try:
             # Retain the header mapping; the PFN array contains only packet-ring pages.
-            address, header = self.memory.map(domid, [gfn])
-            mappings.append((address, header, 1))
-            if len(header) != ffi.sizeof("XENKD_SHM_HEADER"):
-                raise RingError("expected one header page")
+            address = self.memory.map(domid, [gfn])
+            mappings.append((address, 1))
             shared_header = ffi.cast("XENKD_SHM_HEADER *", address)
             generation = shared_header.Generation
             SharedRings.check_header(shared_header, generation)
@@ -834,10 +832,8 @@ class GuestLink:
                 raise RingError("ring PFNs overlap each other or the header")
             if self.attached:
                 self.detach("the guest announced generation %x" % generation)
-            address, area = self.memory.map(domid, gfns)
-            mappings.append((address, area, ring_pages))
-            if len(area) != ffi.sizeof("XENKD_SHM") - ffi.sizeof("XENKD_SHM_HEADER"):
-                raise RingError("expected %d ring pages" % ring_pages)
+            address = self.memory.map(domid, gfns)
+            mappings.append((address, ring_pages))
             # Both mappings are now live. Validate the retained header again before publishing attachment.
             SharedRings.check_header(shared_header, generation)
             current_gfns = list(shared_header.RingGfn)
@@ -847,8 +843,7 @@ class GuestLink:
                 shared_header, ffi.cast("PXENKD_SHM_SLOT", address), generation
             )
         except BaseException as e:
-            for address, view, pages in reversed(mappings):
-                view.release()
+            for address, pages in reversed(mappings):
                 self.memory.unmap(address, pages)
             if not isinstance(e, (OSError, RingError)):
                 raise
@@ -877,8 +872,7 @@ class GuestLink:
         if not self.attached:
             return
         self.rings.detach()
-        for address, view, pages in reversed(self.mapping):
-            view.release()
+        for address, pages in reversed(self.mapping):
             self.memory.unmap(address, pages)
         self.rings = self.mapping = None
         log("detached from the shared area: %s" % reason)
