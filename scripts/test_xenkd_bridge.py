@@ -17,10 +17,12 @@ import unittest
 from typing import Optional
 from unittest import mock
 
-spec = importlib.util.spec_from_file_location(
-    "xenkd_bridge",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "xenkd-bridge.py"),
+BRIDGE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "xenkd-bridge.py"
 )
+spec = importlib.util.spec_from_file_location("xenkd_bridge", BRIDGE_PATH)
+if spec is None or spec.loader is None:
+    raise ImportError("cannot load %s" % BRIDGE_PATH)
 bridge = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bridge)
 
@@ -899,30 +901,38 @@ class IoreqTest(unittest.TestCase):
 class ShutdownTest(unittest.TestCase):
     def test_signals_request_shutdown_without_interrupting_an_operation(self):
         handlers = {}
+        calls = []
 
         def set_signal(which, handler):
             handlers[which] = handler
 
-        def run(args, stopping):
-            self.assertFalse(stopping())
+        def follow_domain(this):
+            calls.append("follow_domain")
+            # Signals during an operation, repeated ones too, don't interrupt it.
             handlers[bridge.signal.SIGINT](bridge.signal.SIGINT, None)
-            self.assertTrue(stopping())
-            # Repeated signals must also let cleanup finish.
             handlers[bridge.signal.SIGTERM](bridge.signal.SIGTERM, None)
-            self.assertTrue(stopping())
-            # Losing the terminal stops the bridge the same way.
-            if sys.platform != "win32":
-                self.assertIs(
-                    handlers[bridge.signal.SIGHUP], handlers[bridge.signal.SIGINT]
-                )
 
-        # run() is replaced, so the arguments don't matter: don't depend on the command line.
-        parser, args = bridge.argparse.ArgumentParser, types.SimpleNamespace()
-        with mock.patch.object(parser, "parse_args", return_value=args):
-            with mock.patch.object(bridge.signal, "signal", side_effect=set_signal):
-                with mock.patch.object(bridge, "run", side_effect=run) as mocked_run:
-                    bridge.main()
-        mocked_run.assert_called_once()
+        # Only main() and its loop are real: nothing touches Xen, the network or the command line.
+        patches = mock.patch.multiple(
+            bridge.Bridge,
+            __init__=lambda this, args: None,
+            follow_domain=follow_domain,
+            serve=lambda this: calls.append("serve"),
+            close=lambda this: calls.append("close"),
+        )
+        signals = mock.patch.object(bridge.signal, "signal", side_effect=set_signal)
+        args = mock.patch.object(
+            bridge, "parse_args", return_value=types.SimpleNamespace()
+        )
+        with patches, signals, args:
+            bridge.main()
+        # The current iteration finishes, then the bridge closes.
+        self.assertEqual(calls, ["follow_domain", "serve", "close"])
+        # Losing the terminal stops the bridge the same way.
+        if sys.platform != "win32":
+            self.assertEqual(
+                handlers[bridge.signal.SIGHUP], handlers[bridge.signal.SIGINT]
+            )
 
 
 class FakeXenstore:

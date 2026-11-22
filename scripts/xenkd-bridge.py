@@ -29,9 +29,7 @@ import sys
 import time
 import uuid
 from typing import (
-    TYPE_CHECKING,
     Any,
-    Callable,
     Dict,
     List,
     Optional,
@@ -43,8 +41,8 @@ from typing import (
 
 from cffi import FFI
 
-# Annotations stick to what Python 3.6 evaluates: typing's generics, and quotes around names defined further down or
-# only for type checkers. A CFFI pointer or library whose type adds nothing is CData.
+# Annotations stick to what Python 3.6 evaluates: typing's generics, and classes defined before their use, quoted only
+# where a class names itself. A CFFI pointer or library whose type adds nothing is CData.
 CData = Any
 # A host and port.
 Address = Tuple[str, int]
@@ -107,10 +105,6 @@ def log(message: str) -> None:
         pass
 
 
-def format_mac(mac: bytes) -> str:
-    return ":".join("%02x" % b for b in mac)
-
-
 def describe_frame(frame: bytes) -> str:
     """One line about a frame, for --verbose."""
     ethertype = frame[12:14]
@@ -152,11 +146,6 @@ def find_domains(key: str, value: str) -> List[int]:
     """The domids of the running domains, other than dom0, whose UUID or name (key) is value."""
     domids = (query("xenstore-list", "/local/domain") or "").split()
     return [int(d) for d in domids if d != "0" and read_domain(d, key) == value]
-
-
-def follow_key() -> str:
-    """What identifies a domain across reboots: its UUID with XAPI, its name with xl (see the module's docstring)."""
-    return "vm" if os.path.exists(XAPI_INVENTORY) else "name"
 
 
 def resolve_domain(domain: str, key: str) -> str:
@@ -413,54 +402,73 @@ ffi.cdef(SHM_CDEF)
 # Its attributes come from the cdefs above, which type checkers can't see.
 cdefs: CData = ffi.dlopen("msvcrt.dll" if sys.platform == "win32" else None)
 
-if TYPE_CHECKING:
-    # What CFFI exposes of the structures declared above, for type checkers only: at run time, these are CFFI
-    # pointers, whose fields read and write Xen's or the guest's memory. Keep them in step with the declarations.
 
-    class Ioreq:
-        """ioreq_t."""
+# What CFFI exposes of the structures declared above, for annotations only: never instantiated, as at run time these
+# are CFFI pointers, whose fields read and write Xen's or the guest's memory. Keep them in step with the declarations.
+class Ioreq:
+    """ioreq_t."""
 
-        addr: int
-        data: int
-        count: int
-        size: int
-        vp_eport: int
-        state: int
-        data_is_ptr: int
-        dir: int
-        df: int
-        type: int
+    addr: int
+    data: int
+    count: int
+    size: int
+    vp_eport: int
+    state: int
+    data_is_ptr: int
+    dir: int
+    df: int
+    type: int
 
-    class IoreqPage:
-        """ioreq_t *, to the server's request page: one request per vCPU."""
 
-        def __getitem__(self, cpu: int) -> Ioreq: ...
+class IoreqPage:
+    """ioreq_t *, to the server's request page: one request per vCPU."""
 
-    class ShmHeader:
-        """PXENKD_SHM_HEADER."""
+    def __getitem__(self, cpu: int) -> Ioreq: ...
 
-        Signature: int
-        Generation: int
-        RingGfn: Sequence[int]
-        TxProd: int
-        TxCons: int
-        RxProd: int
-        RxCons: int
-        Dom0Generation: int
-        Dom0Heartbeat: int
 
-    class ShmSlot:
-        """XENKD_SHM_SLOT."""
+class ShmHeader:
+    """PXENKD_SHM_HEADER."""
 
-        Length: int
-        Data: CData
+    Signature: int
+    Generation: int
+    RingGfn: Sequence[int]
+    TxProd: int
+    TxCons: int
+    RxProd: int
+    RxCons: int
+    Dom0Generation: int
+    Dom0Heartbeat: int
 
-    class ShmSlots:
-        """PXENKD_SHM_SLOT, to an array of slots."""
 
-        def __getitem__(self, index: int) -> ShmSlot: ...
+class ShmSlot:
+    """XENKD_SHM_SLOT."""
 
-        def __add__(self, count: int) -> "ShmSlots": ...
+    Length: int
+    Data: CData
+
+
+class ShmSlots:
+    """PXENKD_SHM_SLOT, to an array of slots."""
+
+    def __getitem__(self, index: int) -> ShmSlot: ...
+
+    # Quoted: the class doesn't exist yet when Python 3.6 evaluates its own annotations.
+    def __add__(self, count: int) -> "ShmSlots": ...
+
+
+def xen_error(operation: str) -> OSError:
+    error = ffi.errno
+    return OSError(error, "%s: %s" % (operation, os.strerror(error)))
+
+
+def xen_check(result: int, operation: str) -> int:
+    if result < 0:
+        raise xen_error(operation)
+    return result
+
+
+def xen_library(name: str) -> CData:
+    return ffi.dlopen("lib%s.so.1" % name)
 
 
 class ForeignMemory:
@@ -500,7 +508,7 @@ class ForeignMemory:
     def unmap(self, address: CData, pages: int) -> None:
         self.lib.xenforeignmemory_unmap(self.handle, address, pages)
 
-    def map_ioreq(self, domid: int, server_id: int) -> Tuple[CData, "IoreqPage"]:
+    def map_ioreq(self, domid: int, server_id: int) -> Tuple[CData, IoreqPage]:
         """Map Xen's ioreq resource, which is not an ordinary guest GFN when the server is enabled."""
         address = ffi.new("void **")
         # memory.h: frame_ioreq(0) = 1 (frame 0 is the buffered ring). CFFI cannot declare function-like macros.
@@ -517,7 +525,7 @@ class ForeignMemory:
         )
         if not resource:
             raise xen_error("xenforeignmemory_map_resource")
-        return resource, cast("IoreqPage", ffi.cast("ioreq_t *", address[0]))
+        return resource, cast(IoreqPage, ffi.cast("ioreq_t *", address[0]))
 
     def unmap_ioreq(self, resource: CData) -> None:
         xen_check(
@@ -527,233 +535,6 @@ class ForeignMemory:
 
     def close(self) -> None:
         self.lib.xenforeignmemory_close(self.handle)
-
-
-def xen_error(operation: str) -> OSError:
-    error = ffi.errno
-    return OSError(error, "%s: %s" % (operation, os.strerror(error)))
-
-
-def xen_check(result: int, operation: str) -> int:
-    if result < 0:
-        raise xen_error(operation)
-    return result
-
-
-def xen_library(name: str) -> CData:
-    return ffi.dlopen("lib%s.so.1" % name)
-
-
-class IoreqServer:
-    """A secondary emulator for one four-byte rendezvous register. It never acquires guest xenbus bindings."""
-
-    # Set once the constructor succeeds, and only used until close().
-    requests: "IoreqPage"
-    fd: int
-
-    def __init__(self, domid: int, io_port: int, memory: ForeignMemory) -> None:
-        self.domid, self.io_port, self.memory = domid, io_port, memory
-        # What close() releases, as far as the constructor got.
-        self.dm_handle: Optional[CData] = None
-        self.evt_handle: Optional[CData] = None
-        self.server_id: Optional[int] = None
-        self.resource: Optional[CData] = None
-        self.enabled = False
-        # Our event channel ports, and the vCPU each is bound to.
-        self.ports: Dict[int, int] = {}
-        self.next_bind_check = 0.0
-        self.dm = xen_library("xendevicemodel")
-        self.evt = xen_library("xenevtchn")
-        try:
-            self.dm_handle = self.dm.xendevicemodel_open(ffi.NULL, 0)
-            if not self.dm_handle:
-                raise xen_error("xendevicemodel_open")
-            self.evt_handle = self.evt.xenevtchn_open(ffi.NULL, 0)
-            if not self.evt_handle:
-                raise xen_error("xenevtchn_open")
-            server_id = ffi.new("ioservid_t *")
-            xen_check(
-                self.dm.xendevicemodel_create_ioreq_server(
-                    self.dm_handle,
-                    self.domid,
-                    cdefs.HVM_IOREQSRV_BUFIOREQ_OFF,
-                    server_id,
-                ),
-                "xendevicemodel_create_ioreq_server",
-            )
-            self.server_id = server_id[0]
-            self.resource, self.requests = memory.map_ioreq(self.domid, server_id[0])
-            # Xen fills vp_eport only when enabled. Map the range last, once all response paths are ready.
-            xen_check(
-                self.dm.xendevicemodel_set_ioreq_server_state(
-                    self.dm_handle, self.domid, self.server_id, 1
-                ),
-                "xendevicemodel_set_ioreq_server_state",
-            )
-            self.enabled = True
-            self.refresh_ports()
-            self.fd = xen_check(self.evt.xenevtchn_fd(self.evt_handle), "xenevtchn_fd")
-            xen_check(
-                self.dm.xendevicemodel_map_io_range_to_ioreq_server(
-                    self.dm_handle, self.domid, self.server_id, 0, io_port, io_port + 3
-                ),
-                "xendevicemodel_map_io_range_to_ioreq_server",
-            )
-        except BaseException:
-            self.close()
-            raise
-        log("listening on i/o port %#x (domain %s)" % (io_port, domid))
-
-    def refresh_ports(self) -> None:
-        """Bind Xen's per-vCPU endpoints, including vCPUs added after startup."""
-        if time.monotonic() < self.next_bind_check:
-            return
-        self.next_bind_check = time.monotonic() + 1.0
-        bound = set(self.ports.values())
-        # The request page holds one ioreq_t per vCPU slot.
-        for cpu in range(PAGE_SIZE // ffi.sizeof("ioreq_t")):
-            remote = self.requests[cpu].vp_eport
-            if remote and cpu not in bound:
-                local = xen_check(
-                    self.evt.xenevtchn_bind_interdomain(
-                        self.evt_handle, self.domid, remote
-                    ),
-                    "xenevtchn_bind_interdomain",
-                )
-                self.ports[local] = cpu
-
-    def dispatch(self, cpu: int, link: "GuestLink") -> None:
-        """Complete even unsupported requests so a stray access cannot leave a vCPU blocked."""
-        request = self.requests[cpu]
-        if request.state != cdefs.STATE_IOREQ_READY:
-            return
-        request.state = cdefs.STATE_IOREQ_INPROCESS
-        try:
-            scalar = (
-                request.type == cdefs.IOREQ_TYPE_PIO
-                and request.addr == self.io_port
-                and request.size == 4
-                and request.count == 1
-                and not request.data_is_ptr
-            )
-            if scalar:
-                if request.dir == cdefs.IOREQ_READ:
-                    request.data = link.accepted_pfn(self.domid)
-                else:
-                    # Keep the issuing vCPU stopped until mapping/unmapping finishes, especially on shutdown.
-                    link.announce(self.domid, request.data & INDEX_MASK)
-            elif request.dir == cdefs.IOREQ_READ and not request.data_is_ptr:
-                request.data = UNCLAIMED_READ
-        finally:
-            # Aligned fields and x86 TSO: data is visible before the response state and notification.
-            request.state = cdefs.STATE_IORESP_READY
-
-    def service(self, link: "GuestLink") -> None:
-        # xenevtchn_pending may block even with O_NONBLOCK on some kernels. Always select before calling it.
-        while select.select([self.fd], [], [], 0)[0]:
-            local = xen_check(
-                self.evt.xenevtchn_pending(self.evt_handle), "xenevtchn_pending"
-            )
-            cpu = self.ports.get(local)
-            try:
-                if cpu is not None:
-                    try:
-                        self.dispatch(cpu, link)
-                    finally:
-                        xen_check(
-                            self.evt.xenevtchn_notify(self.evt_handle, local),
-                            "xenevtchn_notify",
-                        )
-            finally:
-                xen_check(
-                    self.evt.xenevtchn_unmask(self.evt_handle, local),
-                    "xenevtchn_unmask",
-                )
-
-    def drain(self) -> None:
-        """After disabling new requests, wake vCPUs waiting for a response, including an interrupted notification."""
-        self.next_bind_check = 0.0
-        self.refresh_ports()
-        pending = []
-        for local, cpu in self.ports.items():
-            request = self.requests[cpu]
-            state = request.state
-            if state not in (
-                cdefs.STATE_IOREQ_READY,
-                cdefs.STATE_IOREQ_INPROCESS,
-                cdefs.STATE_IORESP_READY,
-            ):
-                continue
-            if state != cdefs.STATE_IORESP_READY:
-                # Don't attach new rings during exit. An unfinished scalar IN sees a detached register.
-                if request.dir == cdefs.IOREQ_READ and not request.data_is_ptr:
-                    request.data = UNCLAIMED_READ
-                request.state = cdefs.STATE_IORESP_READY
-            xen_check(
-                self.evt.xenevtchn_notify(self.evt_handle, local), "xenevtchn_notify"
-            )
-            pending.append(cpu)
-        if not pending:
-            return
-        log("completing %d pending i/o requests before exit" % len(pending))
-        deadline = time.monotonic() + DRAIN_TIMEOUT
-        while True:
-            pending = [
-                cpu
-                for cpu in pending
-                if self.requests[cpu].state != cdefs.STATE_IOREQ_NONE
-            ]
-            if not pending:
-                return
-            if time.monotonic() >= deadline:
-                log(
-                    "timed out waiting for %d i/o responses to be consumed"
-                    % len(pending)
-                )
-                return
-            time.sleep(0.001)
-
-    def close(self) -> None:
-        # Destroying a server frees its event channels; it isn't a substitute for notifying a blocked vCPU.
-        # Disable first so no new requests race with the final responses, and retain the request page until done.
-        if self.enabled:
-            try:
-                xen_check(
-                    self.dm.xendevicemodel_set_ioreq_server_state(
-                        self.dm_handle, self.domid, self.server_id, 0
-                    ),
-                    "xendevicemodel_set_ioreq_server_state",
-                )
-                self.enabled = False
-                self.drain()
-            except OSError as e:
-                if e.errno not in (errno.ESRCH, errno.ENOENT):
-                    log("cannot drain ioreq server: %s" % e)
-        # A server owned by dom0 outlives its process unless explicitly destroyed.
-        if self.server_id is not None:
-            result = self.dm.xendevicemodel_destroy_ioreq_server(
-                self.dm_handle, self.domid, self.server_id
-            )
-            if result < 0 and ffi.errno not in (errno.ESRCH, errno.ENOENT):
-                log(
-                    "cannot destroy ioreq server: %s"
-                    % xen_error("destroy_ioreq_server")
-                )
-            elif result >= 0:
-                log("stopped ioreq server (domain %s)" % self.domid)
-            self.server_id = None
-            self.enabled = False
-        try:
-            if self.resource is not None:
-                self.memory.unmap_ioreq(self.resource)
-                self.resource = None
-        finally:
-            if self.evt_handle:
-                self.evt.xenevtchn_close(self.evt_handle)
-                self.evt_handle = None
-            if self.dm_handle:
-                self.dm.xendevicemodel_close(self.dm_handle)
-                self.dm_handle = None
 
 
 class RingError(Exception):
@@ -769,7 +550,7 @@ class SharedRings:
     indices are kept here, and only written to the header: the guest can't confuse us by changing them.
     """
 
-    def __init__(self, header: "ShmHeader", area: "ShmSlots", generation: int) -> None:
+    def __init__(self, header: ShmHeader, area: ShmSlots, generation: int) -> None:
         """Attach to a header that GuestLink.announce() has just checked (check_header())."""
         self.expected_signature: int = cdefs.XENKD_SHM_SIGNATURE
         self.tx_slots: int = cdefs.XENKD_SHM_TX_SLOTS
@@ -791,7 +572,7 @@ class SharedRings:
         header.Dom0Generation = generation
 
     @staticmethod
-    def check_header(header: "ShmHeader", generation: int) -> None:
+    def check_header(header: ShmHeader, generation: int) -> None:
         """
         The complete signature fixes all geometry; generation identifies this initialization.
         """
@@ -933,7 +714,7 @@ class GuestLink:
             # Retain the header mapping; the PFN array contains only packet-ring pages.
             address = self.memory.map(domid, [gfn])
             mappings.append((address, 1))
-            shared_header = cast("ShmHeader", ffi.cast("XENKD_SHM_HEADER *", address))
+            shared_header = cast(ShmHeader, ffi.cast("XENKD_SHM_HEADER *", address))
             generation = shared_header.Generation
             SharedRings.check_header(shared_header, generation)
             gfns = list(shared_header.RingGfn)
@@ -949,7 +730,7 @@ class GuestLink:
             current_gfns = list(shared_header.RingGfn)
             if current_gfns != gfns:
                 raise RingError("the page list changed while mapping the shared area")
-            slots = cast("ShmSlots", ffi.cast("PXENKD_SHM_SLOT", address))
+            slots = cast(ShmSlots, ffi.cast("PXENKD_SHM_SLOT", address))
             rings = SharedRings(shared_header, slots, generation)
         except (OSError, RingError) as e:
             self.unmap_all(mappings)
@@ -1036,28 +817,213 @@ class GuestLink:
             self.full.drop()
 
 
-def parse_io_port(text: str) -> int:
-    try:
-        port = int(text, 0)
-    except ValueError:
-        raise argparse.ArgumentTypeError("expected an I/O port, such as 0xec")
-    if port <= 0 or port > 0xFFFC or port % 4 != 0:
-        raise argparse.ArgumentTypeError(
-            "I/O port must be nonzero and four-byte aligned, at most 0xfffc"
-        )
-    return port
+class IoreqServer:
+    """A secondary emulator for one four-byte rendezvous register. It never acquires guest xenbus bindings."""
 
+    # Set once the constructor succeeds, and only used until close().
+    requests: IoreqPage
+    fd: int
 
-def parse_address(text: str) -> Address:
-    host, separator, port = text.rpartition(":")
-    if not separator or not host or not port.isdigit():
-        raise argparse.ArgumentTypeError("expected HOST:PORT, got %r" % text)
-    return host, int(port)
+    def __init__(self, domid: int, io_port: int, memory: ForeignMemory) -> None:
+        self.domid, self.io_port, self.memory = domid, io_port, memory
+        # What close() releases, as far as the constructor got.
+        self.dm_handle: Optional[CData] = None
+        self.evt_handle: Optional[CData] = None
+        self.server_id: Optional[int] = None
+        self.resource: Optional[CData] = None
+        self.enabled = False
+        # Our event channel ports, and the vCPU each is bound to.
+        self.ports: Dict[int, int] = {}
+        self.next_bind_check = 0.0
+        self.dm = xen_library("xendevicemodel")
+        self.evt = xen_library("xenevtchn")
+        try:
+            self.dm_handle = self.dm.xendevicemodel_open(ffi.NULL, 0)
+            if not self.dm_handle:
+                raise xen_error("xendevicemodel_open")
+            self.evt_handle = self.evt.xenevtchn_open(ffi.NULL, 0)
+            if not self.evt_handle:
+                raise xen_error("xenevtchn_open")
+            server_id = ffi.new("ioservid_t *")
+            xen_check(
+                self.dm.xendevicemodel_create_ioreq_server(
+                    self.dm_handle,
+                    self.domid,
+                    cdefs.HVM_IOREQSRV_BUFIOREQ_OFF,
+                    server_id,
+                ),
+                "xendevicemodel_create_ioreq_server",
+            )
+            self.server_id = server_id[0]
+            self.resource, self.requests = memory.map_ioreq(self.domid, server_id[0])
+            # Xen fills vp_eport only when enabled. Map the range last, once all response paths are ready.
+            xen_check(
+                self.dm.xendevicemodel_set_ioreq_server_state(
+                    self.dm_handle, self.domid, self.server_id, 1
+                ),
+                "xendevicemodel_set_ioreq_server_state",
+            )
+            self.enabled = True
+            self.refresh_ports()
+            self.fd = xen_check(self.evt.xenevtchn_fd(self.evt_handle), "xenevtchn_fd")
+            xen_check(
+                self.dm.xendevicemodel_map_io_range_to_ioreq_server(
+                    self.dm_handle, self.domid, self.server_id, 0, io_port, io_port + 3
+                ),
+                "xendevicemodel_map_io_range_to_ioreq_server",
+            )
+        except BaseException:
+            self.close()
+            raise
+        log("listening on i/o port %#x (domain %s)" % (io_port, domid))
 
+    def refresh_ports(self) -> None:
+        """Bind Xen's per-vCPU endpoints, including vCPUs added after startup."""
+        if time.monotonic() < self.next_bind_check:
+            return
+        self.next_bind_check = time.monotonic() + 1.0
+        bound = set(self.ports.values())
+        # The request page holds one ioreq_t per vCPU slot.
+        for cpu in range(PAGE_SIZE // ffi.sizeof("ioreq_t")):
+            remote = self.requests[cpu].vp_eport
+            if remote and cpu not in bound:
+                local = xen_check(
+                    self.evt.xenevtchn_bind_interdomain(
+                        self.evt_handle, self.domid, remote
+                    ),
+                    "xenevtchn_bind_interdomain",
+                )
+                self.ports[local] = cpu
 
-def resolve_ipv4(host: str) -> bytes:
-    """A host name or address, as an IPv4 address in network order. Raises OSError."""
-    return socket.inet_aton(socket.gethostbyname(host))
+    def notify(self, port: int) -> None:
+        xen_check(self.evt.xenevtchn_notify(self.evt_handle, port), "xenevtchn_notify")
+
+    def unmask(self, port: int) -> None:
+        xen_check(self.evt.xenevtchn_unmask(self.evt_handle, port), "xenevtchn_unmask")
+
+    def dispatch(self, cpu: int, link: GuestLink) -> None:
+        """Complete even unsupported requests so a stray access cannot leave a vCPU blocked."""
+        request = self.requests[cpu]
+        if request.state != cdefs.STATE_IOREQ_READY:
+            return
+        request.state = cdefs.STATE_IOREQ_INPROCESS
+        try:
+            scalar = (
+                request.type == cdefs.IOREQ_TYPE_PIO
+                and request.addr == self.io_port
+                and request.size == 4
+                and request.count == 1
+                and not request.data_is_ptr
+            )
+            if scalar:
+                if request.dir == cdefs.IOREQ_READ:
+                    request.data = link.accepted_pfn(self.domid)
+                else:
+                    # Keep the issuing vCPU stopped until mapping/unmapping finishes, especially on shutdown.
+                    link.announce(self.domid, request.data & INDEX_MASK)
+            elif request.dir == cdefs.IOREQ_READ and not request.data_is_ptr:
+                request.data = UNCLAIMED_READ
+        finally:
+            # Aligned fields and x86 TSO: data is visible before the response state and notification.
+            request.state = cdefs.STATE_IORESP_READY
+
+    def service(self, link: GuestLink) -> None:
+        # xenevtchn_pending may block even with O_NONBLOCK on some kernels. Always select before calling it.
+        while select.select([self.fd], [], [], 0)[0]:
+            local = xen_check(
+                self.evt.xenevtchn_pending(self.evt_handle), "xenevtchn_pending"
+            )
+            # Even if handling the request fails, notify its vCPU (if the port is one of ours), then unmask the port:
+            # either missing would leave the vCPU blocked. Callbacks run last registered first.
+            with contextlib.ExitStack() as stack:
+                stack.callback(self.unmask, local)
+                cpu = self.ports.get(local)
+                if cpu is not None:
+                    stack.callback(self.notify, local)
+                    self.dispatch(cpu, link)
+
+    def drain(self) -> None:
+        """After disabling new requests, wake vCPUs waiting for a response, including an interrupted notification."""
+        self.next_bind_check = 0.0
+        self.refresh_ports()
+        pending = []
+        for local, cpu in self.ports.items():
+            request = self.requests[cpu]
+            state = request.state
+            if state not in (
+                cdefs.STATE_IOREQ_READY,
+                cdefs.STATE_IOREQ_INPROCESS,
+                cdefs.STATE_IORESP_READY,
+            ):
+                continue
+            if state != cdefs.STATE_IORESP_READY:
+                # Don't attach new rings during exit. An unfinished scalar IN sees a detached register.
+                if request.dir == cdefs.IOREQ_READ and not request.data_is_ptr:
+                    request.data = UNCLAIMED_READ
+                request.state = cdefs.STATE_IORESP_READY
+            self.notify(local)
+            pending.append(cpu)
+        if not pending:
+            return
+        log("completing %d pending i/o requests before exit" % len(pending))
+        deadline = time.monotonic() + DRAIN_TIMEOUT
+        while True:
+            pending = [
+                cpu
+                for cpu in pending
+                if self.requests[cpu].state != cdefs.STATE_IOREQ_NONE
+            ]
+            if not pending:
+                return
+            if time.monotonic() >= deadline:
+                log(
+                    "timed out waiting for %d i/o responses to be consumed"
+                    % len(pending)
+                )
+                return
+            time.sleep(0.001)
+
+    def close(self) -> None:
+        # Destroying a server frees its event channels; it isn't a substitute for notifying a blocked vCPU.
+        # Disable first so no new requests race with the final responses, and retain the request page until done.
+        if self.enabled:
+            try:
+                xen_check(
+                    self.dm.xendevicemodel_set_ioreq_server_state(
+                        self.dm_handle, self.domid, self.server_id, 0
+                    ),
+                    "xendevicemodel_set_ioreq_server_state",
+                )
+                self.enabled = False
+                self.drain()
+            except OSError as e:
+                if e.errno not in (errno.ESRCH, errno.ENOENT):
+                    log("cannot drain ioreq server: %s" % e)
+        # A server owned by dom0 outlives its process unless explicitly destroyed.
+        if self.server_id is not None:
+            result = self.dm.xendevicemodel_destroy_ioreq_server(
+                self.dm_handle, self.domid, self.server_id
+            )
+            if result < 0 and ffi.errno not in (errno.ESRCH, errno.ENOENT):
+                log(
+                    "cannot destroy ioreq server: %s"
+                    % xen_error("destroy_ioreq_server")
+                )
+            elif result >= 0:
+                log("stopped ioreq server (domain %s)" % self.domid)
+            self.server_id = None
+            self.enabled = False
+        try:
+            if self.resource is not None:
+                self.memory.unmap_ioreq(self.resource)
+                self.resource = None
+        finally:
+            if self.evt_handle:
+                self.evt.xenevtchn_close(self.evt_handle)
+                self.evt_handle = None
+            if self.dm_handle:
+                self.dm.xendevicemodel_close(self.dm_handle)
+                self.dm_handle = None
 
 
 def checksum(data: bytes) -> int:
@@ -1099,7 +1065,7 @@ class UdpProxy:
         # where replies come from. It's a label on the bridge's private network: where the debugger really is is
         # decided in dom0 (self.debugger), never by the guest, as dom0 can reach networks the guest can't.
         try:
-            self.host_ip = resolve_ipv4(args.destination[0])
+            self.host_ip = socket.inet_aton(socket.gethostbyname(args.destination[0]))
         except OSError as e:
             raise SystemExit("bad --destination %s: %s" % (args.destination[0], e))
         self.host_port = args.destination[1]
@@ -1114,7 +1080,7 @@ class UdpProxy:
         # Where the debugger really is, independent of where the guest thinks it is. Resolved once, so that DNS can't
         # move it during a session.
         try:
-            ip = resolve_ipv4(args.debugger[0])
+            ip = socket.inet_aton(socket.gethostbyname(args.debugger[0]))
         except OSError as e:
             raise SystemExit("bad debugger address %s: %s" % (args.debugger[0], e))
         self.debugger: Address = socket.inet_ntoa(ip), args.debugger[1]
@@ -1142,6 +1108,25 @@ class UdpProxy:
             "talking to the debugger at %s:%d from dom0 udp port %d"
             % (debugger_ip, debugger_port, port)
         )
+
+    @staticmethod
+    def check_udp(frame: bytes, header_length: int, length: int) -> Optional[str]:
+        """Check a guest frame's IPv4 and UDP headers, and return what's wrong with it (or None)."""
+        ip = frame[14 : 14 + header_length]
+        total_length = struct.unpack("!H", ip[2:4])[0]
+        if header_length < 20 or len(frame) < 14 + total_length:
+            return "truncated"
+        # A zero checksum means it wasn't filled in (left to an offload that doesn't exist here), not that it's wrong.
+        if ip[10:12] != b"\0\0" and checksum(ip) != 0:
+            return "bad IPv4 header checksum"
+        if length < 8 or header_length + length > total_length:
+            return "bad UDP length"
+        udp = frame[14 + header_length : 14 + header_length + length]
+        if udp[6:8] != b"\0\0":
+            pseudo_header = ip[12:20] + struct.pack("!BBH", 0, IPPROTO_UDP, length)
+            if checksum(pseudo_header + udp) != 0:
+                return "bad UDP checksum"
+        return None
 
     def from_guest(self, frame: bytes) -> List[bytes]:
         """Handle a frame from the guest, and return the frames to send back to it."""
@@ -1201,25 +1186,6 @@ class UdpProxy:
             log("cannot send to the debugger: %s" % e)
         return []
 
-    @staticmethod
-    def check_udp(frame: bytes, header_length: int, length: int) -> Optional[str]:
-        """Check a guest frame's IPv4 and UDP headers, and return what's wrong with it (or None)."""
-        ip = frame[14 : 14 + header_length]
-        total_length = struct.unpack("!H", ip[2:4])[0]
-        if header_length < 20 or len(frame) < 14 + total_length:
-            return "truncated"
-        # A zero checksum means it wasn't filled in (left to an offload that doesn't exist here), not that it's wrong.
-        if ip[10:12] != b"\0\0" and checksum(ip) != 0:
-            return "bad IPv4 header checksum"
-        if length < 8 or header_length + length > total_length:
-            return "bad UDP length"
-        udp = frame[14 + header_length : 14 + header_length + length]
-        if udp[6:8] != b"\0\0":
-            pseudo_header = ip[12:20] + struct.pack("!BBH", 0, IPPROTO_UDP, length)
-            if checksum(pseudo_header + udp) != 0:
-                return "bad UDP checksum"
-        return None
-
     def arp(self, frame: bytes) -> List[bytes]:
         operation = struct.unpack("!H", frame[20:22])[0]
         sender_mac, sender_ip, target_ip = frame[22:28], frame[28:32], frame[38:42]
@@ -1248,22 +1214,6 @@ class UdpProxy:
             + sender_ip
         )
         return [reply.ljust(60, b"\0")]
-
-    def from_debugger(self) -> List[bytes]:
-        """Read the datagrams waiting from the debugger, and return them as frames for the guest. Reads at most what
-        the guest's RX ring holds: the rest waits for the next call."""
-        frames: List[bytes] = []
-        for _ in range(cdefs.XENKD_SHM_RX_SLOTS):
-            try:
-                payload = self.socket.recv(65535)
-            except (BlockingIOError, ConnectionRefusedError):
-                break
-            frame = self.frame_for_guest(payload)
-            if frame is not None:
-                frames.append(frame)
-            elif self.args.verbose:
-                log("dropping %d bytes from the debugger: no guest yet" % len(payload))
-        return frames
 
     def frame_for_guest(self, payload: bytes) -> Optional[bytes]:
         """Wrap a datagram from the debugger in the frame the guest would get if the debugger sent it directly, or
@@ -1299,13 +1249,30 @@ class UdpProxy:
             + payload
         )
 
+    def from_debugger(self) -> List[bytes]:
+        """Read the datagrams waiting from the debugger, and return them as frames for the guest. Reads at most what
+        the guest's RX ring holds: the rest waits for the next call."""
+        frames: List[bytes] = []
+        for _ in range(cdefs.XENKD_SHM_RX_SLOTS):
+            try:
+                payload = self.socket.recv(65535)
+            except (BlockingIOError, ConnectionRefusedError):
+                break
+            frame = self.frame_for_guest(payload)
+            if frame is not None:
+                frames.append(frame)
+            elif self.args.verbose:
+                log("dropping %d bytes from the debugger: no guest yet" % len(payload))
+        return frames
+
 
 class Bridge:
     """The domain followed, its rendezvous and rings, and the debugger's socket, tied together."""
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.key = follow_key()
+        # What identifies a domain across reboots: its UUID with XAPI, its name with xl (see the module's docstring).
+        self.key = "vm" if os.path.exists(XAPI_INVENTORY) else "name"
         self.domain = Domain(self.key, resolve_domain(args.domain, self.key))
         self.proxy = UdpProxy(args)
         # Should the rest fail, the socket closes as the process exits: nothing of it outlives the bridge.
@@ -1334,7 +1301,7 @@ class Bridge:
                 self.proxy.guest_mac = kdnet_mac(smbios_uuid)
                 log(
                     "guest MAC is %s (from domain UUID %s)"
-                    % (format_mac(self.proxy.guest_mac), smbios_uuid)
+                    % (":".join("%02x" % b for b in self.proxy.guest_mac), smbios_uuid)
                 )
         if self.server is None and self.domain.domid is not None:
             try:
@@ -1353,6 +1320,13 @@ class Bridge:
                 self.domain.domid = None
         if self.server is not None:
             self.server.refresh_ports()
+
+    def send_to_guest(self, frame: bytes) -> None:
+        if not self.link.attached:
+            return
+        if self.args.verbose:
+            log("proxy > guest: %s" % describe_frame(frame))
+        self.link.send(frame)
 
     def serve(self) -> None:
         """Wait for the debugger, an I/O request or the next poll (no wait while spinning), and pass frames along."""
@@ -1380,13 +1354,6 @@ class Bridge:
             for frame in self.proxy.from_debugger():
                 self.send_to_guest(frame)
 
-    def send_to_guest(self, frame: bytes) -> None:
-        if not self.link.attached:
-            return
-        if self.args.verbose:
-            log("proxy > guest: %s" % describe_frame(frame))
-        self.link.send(frame)
-
     def close(self) -> None:
         # Every step runs even if an earlier one fails, last registered first: release the shared rings, then the ioreq
         # server (whose close() completes any outstanding shutdown OUT), then the memory both used, then the socket.
@@ -1398,17 +1365,26 @@ class Bridge:
             stack.callback(self.link.detach, "the bridge is exiting")
 
 
-def run(args: argparse.Namespace, stopping: Callable[[], bool]) -> None:
-    bridge = Bridge(args)
+def parse_address(text: str) -> Address:
+    host, separator, port = text.rpartition(":")
+    if not separator or not host or not port.isdigit():
+        raise argparse.ArgumentTypeError("expected HOST:PORT, got %r" % text)
+    return host, int(port)
+
+
+def parse_io_port(text: str) -> int:
     try:
-        while not stopping():
-            bridge.follow_domain()
-            bridge.serve()
-    finally:
-        bridge.close()
+        port = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected an I/O port, such as 0xec")
+    if port <= 0 or port > 0xFFFC or port % 4 != 0:
+        raise argparse.ArgumentTypeError(
+            "I/O port must be nonzero and four-byte aligned, at most 0xfffc"
+        )
+    return port
 
 
-def main() -> None:
+def parse_args() -> argparse.Namespace:
     # The docstring's first paragraph comes before the options in --help, the rest after. python -OO strips it.
     summary, _, details = (__doc__ or "").partition("\n\n")
     parser = argparse.ArgumentParser(
@@ -1472,8 +1448,12 @@ def main() -> None:
         action="store_true",
         help="log every frame passed in either direction",
     )
-    args = parser.parse_args()
+    return parser.parse_args()
 
+
+def main() -> None:
+    """Run the bridge until a signal asks it to stop, then release everything."""
+    args = parse_args()
     stop_requested = False
 
     def request_stop(signum: int, frame: object) -> None:
@@ -1481,15 +1461,21 @@ def main() -> None:
         # Don't raise inside an ioreq update, mapping operation or cleanup. Finish the current operation first.
         stop_requested = True
 
+    # Ctrl+C sets the flag instead of raising KeyboardInterrupt. Losing the terminal would otherwise kill the bridge
+    # without cleanup; Windows, where the tests also run, has no SIGHUP, and type checkers understand this test, unlike
+    # hasattr().
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
-    # Losing the terminal would otherwise kill the bridge without cleanup. Windows, where the tests also run, has no
-    # SIGHUP; type checkers understand this test, unlike hasattr().
     if sys.platform != "win32":
         signal.signal(signal.SIGHUP, request_stop)
-    # With SIGINT handled above, Ctrl+C sets the flag instead of raising KeyboardInterrupt.
     try:
-        run(args, lambda: stop_requested)
+        bridge = Bridge(args)
+        try:
+            while not stop_requested:
+                bridge.follow_domain()
+                bridge.serve()
+        finally:
+            bridge.close()
     except (OSError, AttributeError) as e:
         # AttributeError: a Xen library without a function the bridge needs.
         raise SystemExit("cannot run the bridge: %s" % e)
