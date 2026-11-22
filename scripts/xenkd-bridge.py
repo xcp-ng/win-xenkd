@@ -4,9 +4,10 @@
 xenkd gives KDNET a network card made of two rings of Ethernet frames in guest memory (see xenkd/xenkd_shm.h), and
 announces their header PFN with a 32-bit I/O write. The bridge maps the rings from dom0, polls them, and stands in for
 KDNET's network: it answers the guest's ARP, forwards its UDP payloads to the debugger from an ordinary UDP socket, and
-wraps the debugger's replies back into frames. The debugger only needs to reach dom0 on one UDP port: the guest's
-HOST_IP:port, or --debugger. DHCP isn't answered, so the guest needs NO_DHCP and TARGET_IP (as Enable-XenKd.ps1 sets
-them). Attach with `windbg -k net:port=<port>,key=<key>`.
+wraps the debugger's replies back into frames. The debugger only needs to reach dom0 on one UDP port. Where it runs
+is given on the command line; the guest's HOST_IP:port (--destination) is only its address on the bridge's private
+network. DHCP isn't answered, so the guest needs NO_DHCP and TARGET_IP (as Enable-XenKd.ps1 sets them). Attach with
+`windbg -k net:port=<port>,key=<key>`, the port being the debugger's.
 
 The bridge can be restarted during a debug session: it talks to the debugger from a fixed port, knows the guest's
 address right away (its MAC follows from the domain's UUID, its IP is --guest-ip if given), and xenkd announces its
@@ -993,9 +994,9 @@ class UdpProxy:
     """Stand in for KDNET's network: answer its ARP and carry its UDP traffic over a dom0 socket.
 
     Restarting the bridge mustn't break a debug session, so the socket uses a fixed port: WinDbg keeps seeing the target
-    at the same address. A restarted bridge knows the debugger's address from --destination (the guest's HOST_IP and
-    port) and the guest's from --guest-ip (its TARGET_IP), if given, and learns the rest again from its next ARP or UDP
-    packet.
+    at the same address. A restarted bridge knows the debugger's addresses from the command line (where it runs, and
+    --destination, the guest's HOST_IP and port) and the guest's from --guest-ip (its TARGET_IP), if given, and learns
+    the rest again from its next ARP or UDP packet.
     """
 
     def __init__(self, args):
@@ -1010,8 +1011,8 @@ class UdpProxy:
         if args.guest_ip:
             self.guest_ip = socket.inet_aton(args.guest_ip)
         # The debugger as the guest addresses it, its HOST_IP and port: the only address its frames may go to, and
-        # where replies come from. Where the debugger really is is decided in dom0 (self.debugger), never by the
-        # guest: dom0 can reach networks the guest can't.
+        # where replies come from. It's a label on the bridge's private network: where the debugger really is is
+        # decided in dom0 (self.debugger), never by the guest, as dom0 can reach networks the guest can't.
         try:
             self.host_ip = resolve_ipv4(args.destination[0])
         except OSError as e:
@@ -1025,16 +1026,13 @@ class UdpProxy:
             log("only talking to guest %s" % socket.inet_ntoa(self.guest_ip))
         else:
             log("talking to any guest address")
-        # Where the debugger really is: --debugger, or else where the guest thinks it is. Resolved once, so that DNS
-        # can't move it during a session.
-        if args.debugger is None:
-            self.debugger = socket.inet_ntoa(self.host_ip), self.host_port
-        else:
-            try:
-                ip = resolve_ipv4(args.debugger[0])
-            except OSError as e:
-                raise SystemExit("bad --debugger %s: %s" % (args.debugger[0], e))
-            self.debugger = socket.inet_ntoa(ip), args.debugger[1]
+        # Where the debugger really is, independent of where the guest thinks it is. Resolved once, so that DNS can't
+        # move it during a session.
+        try:
+            ip = resolve_ipv4(args.debugger[0])
+        except OSError as e:
+            raise SystemExit("bad debugger address %s: %s" % (args.debugger[0], e))
+        self.debugger = socket.inet_ntoa(ip), args.debugger[1]
         self.refused = DropCounter("the debugger isn't listening")
 
     def open_socket(self):
@@ -1316,11 +1314,11 @@ def main():
         " domid or other identifier while it runs",
     )
     parser.add_argument(
-        "-d",
-        "--debugger",
+        "debugger",
         type=parse_address,
         metavar="HOST:PORT",
-        help="the debugger's address (default: the guest's HOST_IP and port)",
+        help="where the debugger runs, as dom0 reaches it: the only address the bridge"
+        " sends to and accepts datagrams from",
     )
     parser.add_argument(
         "--guest-ip",
@@ -1333,9 +1331,9 @@ def main():
         type=parse_address,
         default=DEFAULT_DESTINATION,
         metavar="IP:PORT",
-        help="only forward UDP the guest sends to this address, its HOST_IP and port as"
-        " set by Enable-XenKd.ps1 -HostIp and -Port, and only answer ARP for the IP"
-        " (default: %(default)s)",
+        help="the debugger's address as the guest sees it, on the bridge's private"
+        " network: its HOST_IP and port, as set by Enable-XenKd.ps1 -HostIp and -Port."
+        " The guest's frames for other addresses are dropped (default: %(default)s)",
     )
     parser.add_argument(
         "--local-port",

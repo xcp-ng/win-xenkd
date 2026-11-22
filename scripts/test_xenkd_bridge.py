@@ -992,7 +992,8 @@ class ShutdownTest(unittest.TestCase):
             handlers[bridge.signal.SIGTERM](bridge.signal.SIGTERM, None)
             self.assertTrue(stopping())
 
-        with mock.patch.object(bridge.sys, "argv", ["xenkd-bridge.py", DOMID]):
+        argv = ["xenkd-bridge.py", DOMID, "192.0.2.7:50000"]
+        with mock.patch.object(bridge.sys, "argv", argv):
             with mock.patch.object(bridge.signal, "signal", side_effect=set_signal):
                 with mock.patch.object(bridge, "run", side_effect=run) as mocked_run:
                     bridge.main()
@@ -1168,7 +1169,7 @@ class ChecksumTest(unittest.TestCase):
             types.SimpleNamespace(
                 guest_ip="169.254.0.2",
                 destination=("169.254.0.1", 50000),
-                debugger=None,
+                debugger=("192.0.2.7", 50000),
                 local_port=None,
             )
         )
@@ -1188,7 +1189,10 @@ class FilterTest(unittest.TestCase):
     HOST = b"\xa9\xfe\x00\x01"
 
     def make_proxy(
-        self, guest_ip="169.254.0.2", destination=("169.254.0.1", 5364), debugger=None
+        self,
+        guest_ip="169.254.0.2",
+        destination=("169.254.0.1", 5364),
+        debugger=("192.0.2.7", 50000),
     ):
         proxy = bridge.UdpProxy(
             types.SimpleNamespace(
@@ -1231,16 +1235,16 @@ class FilterTest(unittest.TestCase):
         self.assertEqual((proxy.host_ip, proxy.host_port), (self.HOST, 5364))
 
     def test_debugger_is_decided_in_dom0(self):
-        # Where the guest thinks the debugger is, unless --debugger says otherwise.
-        self.assertEqual(self.make_proxy().debugger, ("169.254.0.1", 5364))
-        proxy = self.make_proxy(debugger=("192.0.2.7", 50000))
-        self.assertEqual(proxy.debugger, ("192.0.2.7", 50000))
+        # Where the debugger really is and where the guest thinks it is are independent, and the guest's frames change
+        # neither.
+        proxy = self.make_proxy()
         proxy.from_guest(self.guest_frame(self.GUEST))
         self.assertEqual(proxy.sent, [b"hello"])
         self.assertEqual(proxy.debugger, ("192.0.2.7", 50000))
+        self.assertEqual((proxy.host_ip, proxy.host_port), (self.HOST, 5364))
 
     def test_socket_is_connected_to_the_debugger(self):
-        proxy = self.make_proxy(debugger=("192.0.2.7", 50000))
+        proxy = self.make_proxy()
         with mock.patch.object(bridge.socket, "socket") as socket_type:
             proxy.open_socket()
         connection = socket_type.return_value

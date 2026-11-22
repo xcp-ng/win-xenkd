@@ -11,10 +11,13 @@
 
 .PARAMETER HostIp
     Debugger host IP for "bcdedit /dbgsettings net". KDNET requires network debug settings to load extension modules.
-    bcdedit rejects 0.0.0.0, so the default is a loopback placeholder.
+    This is only the debugger's address on the private network between the guest and the dom0 bridge, and must match
+    the bridge's --destination. Where the debugger really runs is given to the bridge. bcdedit rejects 0.0.0.0, so the
+    default is a link-local placeholder.
 
 .PARAMETER Port
-    Debugger port for "bcdedit /dbgsettings net".
+    Debugger port for "bcdedit /dbgsettings net". Like HostIp, only the debugger's port on the private network: it must
+    match the bridge's --destination, not WinDbg's port.
 
 .PARAMETER Key
     Debugger key. If omitted, bcdedit generates one and prints it.

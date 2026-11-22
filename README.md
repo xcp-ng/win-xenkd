@@ -82,7 +82,7 @@ This produces `xenkd\x64\Release\kd_08_5853.dll`, test-signed. Only x64 is suppo
 2. From an elevated PowerShell in that folder:
 
    ```powershell
-   .\Enable-XenKd.ps1 -HostIp <debug host IP> -BootDebug -ComPort 1
+   .\Enable-XenKd.ps1 -BootDebug -ComPort 1
    ```
 
    The script finds the xenkd device, installs the DLL into System32, sets the rendezvous port, and points the kernel
@@ -96,8 +96,8 @@ port when the guest boots, and continue (`g`) at the winload break.
 
 | Parameter     | Default        | Meaning                                                                  |
 |---------------|----------------|--------------------------------------------------------------------------|
-| `-HostIp`     | `169.254.0.1`  | Where WinDbg is listening                                                |
-| `-Port`       | `5364`         | WinDbg's UDP port                                                        |
+| `-HostIp`     | `169.254.0.1`  | WinDbg's address as the guest sees it (the bridge's `--destination`)     |
+| `-Port`       | `5364`         | WinDbg's port as the guest sees it (the bridge's `--destination`)        |
 | `-Key`        | random         | KDNET encryption key                                                     |
 | `-TargetIp`   | `169.254.0.2`  | The guest's address on the debug link (the bridge's `--guest-ip`)        |
 | `-IoPort`     | `0xEC`         | Rendezvous I/O port; must match the bridge's `--io-port`                 |
@@ -112,10 +112,11 @@ port when the guest boots, and continue (`g`) at the winload break.
 Copy [scripts/xenkd-bridge.py](scripts/xenkd-bridge.py) to dom0 (with LF line endings) and start it:
 
 ```sh
-./xenkd-bridge.py <domain UUID, name or domid>
+./xenkd-bridge.py <domain UUID, name or domid> <debug host>:<port>
 ```
 
-or, with PyPy, `pypy3 xenkd-bridge.py <domain>`.
+or, with PyPy, `pypy3 xenkd-bridge.py <domain> <debug host>:<port>`. The second argument is where WinDbg runs, as dom0
+reaches it.
 
 The bridge follows the domain across reboots, which change its domid:
 
@@ -128,20 +129,23 @@ what to follow from the running domain.
 On the debug host:
 
 ```
-windbg -k net:port=5364,key=<key>
+windbg -k net:port=<port>,key=<key>
 ```
+
+with the port given to the bridge, and the key `Enable-XenKd.ps1` printed (bcdedit's) or was given with `-Key`.
 
 dom0 stands in for the network. The bridge answers the guest's ARP, sends KDNET's UDP payloads to WinDbg from an
 ordinary socket, and wraps the replies back into frames. No TAP, bridge or routing is needed: WinDbg only has to reach
 dom0 on one UDP port, and accept packets from it.
 
-Where WinDbg is gets decided in dom0, never by the guest: `--debugger`, or else `--destination`, resolved once at
-startup. The guest's frames for any other address are dropped. The socket is connected to WinDbg's address, so the
-kernel drops datagrams from anyone else before they reach the bridge or the guest.
+The guest and the bridge share a private network, on which WinDbg's address is the guest's `-HostIp` and `-Port`
+(`--destination` on the bridge, `169.254.0.1:5364` on both by default). Where WinDbg really is gets decided in dom0,
+never by the guest: it's the bridge's second argument, resolved once at startup. The guest's frames for any other
+address are dropped. The socket is connected to WinDbg's address, so the kernel drops datagrams from anyone else
+before they reach the bridge or the guest.
 
 | Option                       | Default                    | Meaning                                                  |
 |------------------------------|----------------------------|----------------------------------------------------------|
-| `-d`, `--debugger HOST:PORT` | the guest's `HOST_IP:port` | Where WinDbg runs, overrides the guest's choice          |
 | `--destination IP:PORT`      | `169.254.0.1:5364`         | The guest's `-HostIp` and `-Port`; ignore other traffic  |
 | `--guest-ip IP`              | any                        | The guest's `-TargetIp`; ignore other guest addresses    |
 | `--local-port PORT`          | WinDbg's port              | dom0's port; set it if WinDbg runs in dom0               |
