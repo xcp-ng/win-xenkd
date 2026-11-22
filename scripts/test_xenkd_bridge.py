@@ -1187,20 +1187,21 @@ class FilterTest(unittest.TestCase):
     OTHER = b"\xa9\xfe\x77\x28"
     HOST = b"\xa9\xfe\x00\x01"
 
-    def make_proxy(self, guest_ip="169.254.0.2", destination=("169.254.0.1", 5364)):
+    def make_proxy(
+        self, guest_ip="169.254.0.2", destination=("169.254.0.1", 5364), debugger=None
+    ):
         proxy = bridge.UdpProxy(
             types.SimpleNamespace(
                 guest_ip=guest_ip,
                 destination=destination,
-                debugger=None,
+                debugger=debugger,
                 local_port=None,
             )
         )
         proxy.guest_mac = b"\x02" * 6
         proxy.sent = []
-        proxy.socket = types.SimpleNamespace(
-            sendto=lambda data, address: proxy.sent.append(data)
-        )
+        # Connected to the debugger: no address to send to.
+        proxy.socket = types.SimpleNamespace(send=proxy.sent.append)
         return proxy
 
     def guest_frame(self, source_ip, payload=b"hello"):
@@ -1228,6 +1229,37 @@ class FilterTest(unittest.TestCase):
         proxy.from_guest(self.guest_frame(self.GUEST))
         self.assertEqual(proxy.sent, [b"hello"])
         self.assertEqual((proxy.host_ip, proxy.host_port), (self.HOST, 5364))
+
+    def test_debugger_is_decided_in_dom0(self):
+        # Where the guest thinks the debugger is, unless --debugger says otherwise.
+        self.assertEqual(self.make_proxy().debugger, ("169.254.0.1", 5364))
+        proxy = self.make_proxy(debugger=("192.0.2.7", 50000))
+        self.assertEqual(proxy.debugger, ("192.0.2.7", 50000))
+        proxy.from_guest(self.guest_frame(self.GUEST))
+        self.assertEqual(proxy.sent, [b"hello"])
+        self.assertEqual(proxy.debugger, ("192.0.2.7", 50000))
+
+    def test_socket_is_connected_to_the_debugger(self):
+        proxy = self.make_proxy(debugger=("192.0.2.7", 50000))
+        with mock.patch.object(bridge.socket, "socket") as socket_type:
+            proxy.open_socket()
+        connection = socket_type.return_value
+        # From the debugger's port (no --local-port), and connected, so that the kernel drops anyone else's datagrams.
+        connection.bind.assert_called_once_with(("0.0.0.0", 50000))
+        connection.connect.assert_called_once_with(("192.0.2.7", 50000))
+        order = [call[0] for call in connection.mock_calls]
+        self.assertLess(order.index("bind"), order.index("connect"))
+
+    def test_counts_refused_sends(self):
+        proxy = self.make_proxy()
+
+        def refuse(data):
+            raise ConnectionRefusedError
+
+        proxy.socket = types.SimpleNamespace(send=refuse)
+        proxy.from_guest(self.guest_frame(self.GUEST))
+        proxy.from_guest(self.guest_frame(self.GUEST))
+        self.assertEqual(proxy.refused.count, 2)
 
     def test_reads_every_waiting_datagram(self):
         proxy = self.make_proxy()

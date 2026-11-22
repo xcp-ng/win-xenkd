@@ -1010,8 +1010,8 @@ class UdpProxy:
         if args.guest_ip:
             self.guest_ip = socket.inet_aton(args.guest_ip)
         # The debugger as the guest addresses it, its HOST_IP and port: the only address its frames may go to, and
-        # where replies come from. Where the debugger really is is decided in dom0 (debugger()), never by the guest:
-        # dom0 can reach networks the guest can't.
+        # where replies come from. Where the debugger really is is decided in dom0 (self.debugger), never by the
+        # guest: dom0 can reach networks the guest can't.
         try:
             self.host_ip = resolve_ipv4(args.destination[0])
         except OSError as e:
@@ -1025,29 +1025,39 @@ class UdpProxy:
             log("only talking to guest %s" % socket.inet_ntoa(self.guest_ip))
         else:
             log("talking to any guest address")
-        # Otherwise the socket opens once the guest says which port it talks to.
-        if args.local_port or args.debugger is not None:
-            self.open_socket(args.local_port or args.debugger[1])
+        # Where the debugger really is: --debugger, or else where the guest thinks it is. Resolved once, so that DNS
+        # can't move it during a session.
+        if args.debugger is None:
+            self.debugger = socket.inet_ntoa(self.host_ip), self.host_port
+        else:
+            try:
+                ip = resolve_ipv4(args.debugger[0])
+            except OSError as e:
+                raise SystemExit("bad --debugger %s: %s" % (args.debugger[0], e))
+            self.debugger = socket.inet_ntoa(ip), args.debugger[1]
+        self.refused = DropCounter("the debugger isn't listening")
 
-    def open_socket(self, port):
+    def open_socket(self):
+        """Talk to the debugger from a fixed port, so that a restarted bridge keeps its address. The socket is
+        connected: the kernel drops datagrams from anyone else before they reach the bridge, or the guest."""
+        port = self.args.local_port or self.debugger[1]
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         # Rebind right away after a restart, so the debugger keeps seeing the target at the same address.
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             self.socket.bind(("0.0.0.0", port))
+            self.socket.connect(self.debugger)
         except OSError as e:
             raise SystemExit(
-                "cannot use udp port %d: %s (if the debugger runs in dom0, pick another"
-                " one with --local-port)" % (port, e)
+                "cannot talk to the debugger at %s:%d from udp port %d: %s (if the"
+                " debugger runs in dom0, pick another port with --local-port)"
+                % (self.debugger + (port, e))
             )
         self.socket.setblocking(False)
-        target = " at %s:%d" % self.args.debugger if self.args.debugger else ""
-        log("talking to the debugger%s from dom0 udp port %d" % (target, port))
-
-    def debugger(self):
-        if self.args.debugger is not None:
-            return self.args.debugger
-        return socket.inet_ntoa(self.host_ip), self.host_port
+        log(
+            "talking to the debugger at %s:%d from dom0 udp port %d"
+            % (self.debugger + (port,))
+        )
 
     def from_guest(self, frame):
         """Handle a frame from the guest, and return the frames to send back to it."""
@@ -1092,13 +1102,14 @@ class UdpProxy:
                 % (
                     (socket.inet_ntoa(self.guest_ip), self.guest_port)
                     + (socket.inet_ntoa(self.host_ip), self.host_port)
-                    + self.debugger()
+                    + self.debugger
                 )
             )
-        if self.socket is None:
-            self.open_socket(self.host_port)
         try:
-            self.socket.sendto(frame[udp + 8 : udp + length], self.debugger())
+            self.socket.send(frame[udp + 8 : udp + length])
+        except ConnectionRefusedError:
+            # The connected socket reports the debugger's port as unreachable: it isn't running (yet).
+            self.refused.drop()
         except OSError as e:
             log("cannot send to the debugger: %s" % e)
         return []
@@ -1212,6 +1223,7 @@ def run(args, stopping):
 
     try:
         proxy = UdpProxy(args)
+        proxy.open_socket()
         while not stopping():
             # Domain lookups run commands, so defer them while packet traffic is active.
             changed = domain.poll() if not link.busy() else False

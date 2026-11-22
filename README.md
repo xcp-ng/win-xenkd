@@ -135,6 +135,10 @@ dom0 stands in for the network. The bridge answers the guest's ARP, sends KDNET'
 ordinary socket, and wraps the replies back into frames. No TAP, bridge or routing is needed: WinDbg only has to reach
 dom0 on one UDP port, and accept packets from it.
 
+Where WinDbg is gets decided in dom0, never by the guest: `--debugger`, or else `--destination`, resolved once at
+startup. The guest's frames for any other address are dropped. The socket is connected to WinDbg's address, so the
+kernel drops datagrams from anyone else before they reach the bridge or the guest.
+
 | Option                       | Default                    | Meaning                                                  |
 |------------------------------|----------------------------|----------------------------------------------------------|
 | `-d`, `--debugger HOST:PORT` | the guest's `HOST_IP:port` | Where WinDbg runs, overrides the guest's choice          |
