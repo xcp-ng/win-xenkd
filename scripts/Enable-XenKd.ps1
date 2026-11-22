@@ -1,4 +1,3 @@
-#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     Enables kernel debugging through the xenkd device.
@@ -56,6 +55,8 @@
 .EXAMPLE
     .\Enable-XenKd.ps1 -ClearAll
 #>
+# After the help block: right in front of it, #Requires hides it from Get-Help.
+#Requires -RunAsAdministrator
 [CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'Kernel')]
 param(
     # The default addresses are link-local, since the network is a private link, and in 169.254.0.0/24, which
